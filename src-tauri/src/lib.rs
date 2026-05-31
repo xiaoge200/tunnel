@@ -53,17 +53,31 @@ fn tray_icon(r: u8, g: u8, b: u8) -> Image<'static> {
     Image::new(leaked, 24, 24)
 }
 
-#[tauri::command]
-async fn get_tunnels(state: tauri::State<'_, AppState>) -> Result<Vec<TunnelConfig>, String> {
-    Ok(state.config.lock().await.tunnels.clone())
+pub fn set_tray_icon(app: &tauri::AppHandle, status: TunnelStatus) {
+    if let Some(tray) = app.tray_by_id("tunnel_tray") {
+        let icon_image = match status {
+            TunnelStatus::Connected => tray_icon(0, 255, 0), // 绿色
+            TunnelStatus::Connecting => tray_icon(255, 200, 0), // 亮黄色
+            TunnelStatus::Disconnected => tray_icon(120, 120, 120), // 灰色
+            TunnelStatus::Error(_) => tray_icon(255, 0, 0),  // 红色
+        };
+        let _ = tray.set_icon(Some(icon_image));
+    }
 }
 
 #[tauri::command]
-async fn save_tunnels(
+async fn get_config(state: tauri::State<'_, AppState>) -> Result<AppConfig, String> {
+    Ok(state.config.lock().await.clone())
+}
+
+#[tauri::command]
+async fn save_config(
     state: tauri::State<'_, AppState>,
-    tunnels: Vec<TunnelConfig>,
+    config: TunnelConfig,
 ) -> Result<(), String> {
-    state.config.lock().await.tunnels = tunnels;
+    let mut app_config = state.config.lock().await;
+    app_config.tunnel = Some(config);
+    save_config_to_file(&state.config_path, &app_config);
     Ok(())
 }
 
@@ -90,36 +104,56 @@ async fn show_config_window(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn start_tunnel(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    config: TunnelConfig,
-) -> Result<(), String> {
+async fn start_tunnel(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let mgr = state.manager.clone();
-    mgr.start_tunnel(config).await;
-    if let Some(tray) = app.tray_by_id("tunnel_tray") {
-        let _ = tray.set_icon(Some(tray_icon(255, 200, 0)));
-    }
+    mgr.start_tunnel().await;
     Ok(())
 }
 
 #[tauri::command]
-async fn stop_tunnel(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
+async fn stop_tunnel(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let mgr = state.manager.clone();
-    mgr.stop_tunnel(&id).await;
-    if let Some(tray) = app.tray_by_id("tunnel_tray") {
-        let _ = tray.set_icon(Some(tray_icon(120, 120, 120)));
-    }
+    mgr.stop_tunnel().await;
     Ok(())
 }
 
 struct AppState {
     config: Arc<Mutex<AppConfig>>,
+    config_path: std::path::PathBuf,
     manager: Arc<TunnelManager>,
+}
+
+fn load_config(path: &std::path::Path) -> AppConfig {
+    match std::fs::read_to_string(path) {
+        Ok(json) => {
+            let mut cfg: AppConfig = serde_json::from_str(&json).unwrap_or_else(|e| {
+                log::warn!("Failed to parse config, using defaults: {}", e);
+                AppConfig::defaults()
+            });
+            cfg.decrypt_passwords();
+            cfg
+        }
+        Err(_) => {
+            log::info!("No saved config found, using defaults");
+            AppConfig::defaults()
+        }
+    }
+}
+
+fn save_config_to_file(path: &std::path::Path, config: &AppConfig) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut to_save = config.clone();
+    to_save.encrypt_passwords();
+    match serde_json::to_string_pretty(&to_save) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(path, json) {
+                log::error!("Failed to save config: {}", e);
+            }
+        }
+        Err(e) => log::error!("Failed to serialize config: {}", e),
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -149,14 +183,14 @@ pub fn run() {
                 .tooltip("Tunnel")
                 .on_menu_event(move |app, event| match event.id().as_ref() {
                     "connect" => {
-                        log::info!("Disconnect all requested");
                         let mgr = app.state::<AppState>().manager.clone();
                         tauri::async_runtime::spawn(async move {
-                            mgr.stop_all_tunnels().await;
+                            if mgr.is_running().await {
+                                mgr.stop_tunnel().await;
+                            } else {
+                                mgr.start_tunnel().await;
+                            }
                         });
-                        if let Some(tray) = app.tray_by_id("tunnel_tray") {
-                            let _ = tray.set_icon(Some(tray_icon(120, 120, 120)));
-                        }
                     }
                     "open_config" => {
                         let handle = app.clone();
@@ -203,10 +237,19 @@ pub fn run() {
 
             // ── Application State ──────────────────────────────────────
             let app_handle = app.handle().clone();
-            let manager = Arc::new(TunnelManager::new(app_handle.clone()));
+            let config_dir = app
+                .path()
+                .app_config_dir()
+                .expect("failed to resolve config dir");
+            let config_path = config_dir.join("tunnel.json");
+            let config = load_config(&config_path);
+            let config_arc = Arc::new(Mutex::new(config));
+
+            let manager = Arc::new(TunnelManager::new(app_handle.clone(), config_arc.clone()));
 
             let state = AppState {
-                config: Arc::new(Mutex::new(AppConfig::defaults())),
+                config: config_arc,
+                config_path,
                 manager,
             };
             app.manage(state);
@@ -214,8 +257,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            get_tunnels,
-            save_tunnels,
+            get_config,
+            save_config,
             show_config_window,
             start_tunnel,
             stop_tunnel,

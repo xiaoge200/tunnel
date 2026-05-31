@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Tunnel",
   "version": "0.1.0",
-  "identifier": "com.xiaoge.Tunnel",
+  "identifier": "com.xiaoge.tunnel",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",

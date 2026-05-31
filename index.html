@@ -8,7 +8,7 @@
         <script type="module" src="/src/main.ts" defer></script>
     </head>
     <body>
-        <!-- Mini Widget View - 整个容器可拖拽 -->
+        <!-- Mini Widget View -->
         <div id="mini-widget-view" class="widget-container">
             <div class="widget-header">
                 <span class="widget-title">Tunnel</span>
@@ -36,11 +36,11 @@
                     </div>
                     <div class="metric-item">
                         <span class="metric-label">⬇ 下行</span>
-                        <span class="metric-value" id="metric-rx">0 KB/s</span>
+                        <span class="metric-value" id="metric-rx">0 B/s</span>
                     </div>
                     <div class="metric-item">
                         <span class="metric-label">⬆ 上行</span>
-                        <span class="metric-value" id="metric-tx">0 KB/s</span>
+                        <span class="metric-value" id="metric-tx">0 B/s</span>
                     </div>
                 </div>
                 <div class="canvas-wrapper">
@@ -59,85 +59,8 @@
                 <h2>Tunnel - 配置</h2>
             </div>
             <div class="config-body">
-                <div id="tunnel-list">
-                    <p id="no-tunnels-msg">
-                        还没有配置隧道，点击「添加隧道」开始配置。
-                    </p>
-                </div>
-                <div class="config-actions">
-                    <button id="btn-add-tunnel" class="btn-primary">
-                        + 添加隧道
-                    </button>
-                </div>
+                <div id="tunnel-editor-area"></div>
             </div>
         </div>
-
-        <!-- Tunnel Editor Template (hidden) -->
-        <template id="tunnel-editor-template">
-            <div class="tunnel-editor">
-                <input class="field-name" placeholder="隧道名称" />
-                <div class="editor-grid">
-                    <label
-                        >SSH 主机<input
-                            class="field-ssh-host"
-                            placeholder="your-server.com"
-                    /></label>
-                    <label
-                        >端口<input
-                            class="field-ssh-port"
-                            type="number"
-                            value="22"
-                    /></label>
-                    <label
-                        >用户<input class="field-ssh-user" placeholder="root"
-                    /></label>
-                    <label
-                        >认证方式<select class="field-auth-type">
-                            <option value="password">密码</option>
-                            <option value="key">私钥</option>
-                        </select></label
-                    >
-                    <label
-                        >密码<input
-                            class="field-password"
-                            type="password"
-                            placeholder="密码"
-                    /></label>
-                    <label
-                        >密钥路径
-                        <span class="key-path-row">
-                            <input
-                                class="field-key-path"
-                                placeholder="/path/to/id_rsa"
-                            />
-                            <button type="button" class="btn-browse">
-                                浏览
-                            </button>
-                        </span>
-                    </label>
-                    <label
-                        >本地端口<input
-                            class="field-local-port"
-                            type="number"
-                            value="15432"
-                    /></label>
-                    <label
-                        >目标主机<input
-                            class="field-target-host"
-                            placeholder="127.0.0.1"
-                    /></label>
-                    <label
-                        >目标端口<input
-                            class="field-target-port"
-                            type="number"
-                            value="5432"
-                    /></label>
-                </div>
-                <div class="editor-actions">
-                    <button class="btn-start-tunnel">▶ 启动</button>
-                    <button class="btn-delete-tunnel">🗑 删除</button>
-                </div>
-            </div>
-        </template>
     </body>
 </html>

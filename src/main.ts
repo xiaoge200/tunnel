@@ -5,19 +5,13 @@ import { open } from "@tauri-apps/plugin-dialog";
 
 // ─── Types ────────────────────────────────────────────────────────────
 
-interface TunnelMetric {
-  id: string;
-  name: string;
-  status: "Disconnected" | "Connecting" | "Connected" | { Error: string };
-  latency_ms: number;
-  rx_bytes_per_sec: number;
-  tx_bytes_per_sec: number;
+interface ForwardRule {
   local_port: number;
-  target: string;
+  target_host: string;
+  target_port: number;
 }
 
 interface TunnelConfig {
-  id: string;
   name: string;
   ssh_host: string;
   ssh_port: number;
@@ -25,18 +19,20 @@ interface TunnelConfig {
   auth_method:
     | { Password: { password: string } }
     | { Key: { private_key_path: string; passphrase: string | null } };
-  local_port: number;
-  target_host: string;
-  target_port: number;
-  enabled: boolean;
+  forwards: ForwardRule[];
 }
 
-const statusMap: Record<string, string> = {
-  Connected: "已连接",
-  Connecting: "连接中…",
-  Disconnected: "未连接",
-  Error: "错误",
-};
+interface TunnelMetric {
+  name: string;
+  status: "Disconnected" | "Connecting" | "Connected" | { Error: string };
+  latency_ms: number;
+  rx_bytes_per_sec: number;
+  tx_bytes_per_sec: number;
+}
+
+interface AppConfig {
+  tunnel: TunnelConfig | null;
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 
@@ -51,48 +47,44 @@ function formatBytes(bytesPerSec: number): string {
   return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
 }
 
-// ─── Canvas Latency Graph Engine (Optimized) ──────────────────────────
+// ─── Canvas Latency Graph ─────────────────────────────────────────────
 
 class LatencyGraph {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
-  private data: Float64Array;
+  private data: number[];
   private maxPoints: number;
-  private maxLatency: number;
+  private maxLatency = 50;
   private stepX: number;
-  private gradient: CanvasGradient | null = null;
-  private glowGradient: CanvasGradient | null = null;
+  private gradient: CanvasGradient;
+  private glowGradient: CanvasGradient;
   private renderPending = false;
 
-  constructor(canvas: HTMLCanvasElement, maxPoints = 30) {
+  constructor(canvas: HTMLCanvasElement, maxPoints: number) {
+    const ctx = canvas.getContext("2d")!;
     this.canvas = canvas;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) throw new Error("Canvas 2D context unavailable");
     this.ctx = ctx;
-    this.data = new Float64Array(maxPoints);
+    this.data = [];
     this.maxPoints = maxPoints;
-    this.maxLatency = 200;
     this.stepX = canvas.width / (maxPoints - 1);
-    this.clear();
-  }
 
-  clear() {
-    this.data.fill(0);
-    this.renderNow();
+    this.gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    this.gradient.addColorStop(0, "rgba(0, 245, 160, 0.25)");
+    this.gradient.addColorStop(1, "rgba(0, 245, 160, 0.02)");
+
+    this.glowGradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    this.glowGradient.addColorStop(0, "rgba(0, 245, 160, 0.8)");
+    this.glowGradient.addColorStop(1, "rgba(0, 245, 160, 0.1)");
   }
 
   push(value: number) {
-    // Shift array left by 1 (不做完整移位，用环形缓冲区更好，但先保持简单)
     const arr = this.data;
-    for (let i = 0; i < this.maxPoints - 1; i++) {
-      arr[i] = arr[i + 1];
-    }
-    arr[this.maxPoints - 1] = Math.min(value, this.maxLatency);
+    arr.push(value);
+    if (arr.length > this.maxPoints) arr.shift();
     this.scheduleRender();
   }
 
   private scheduleRender() {
-    // 用 requestAnimationFrame 节流，避免每秒 1000 次重绘
     if (this.renderPending) return;
     this.renderPending = true;
     requestAnimationFrame(() => {
@@ -102,84 +94,41 @@ class LatencyGraph {
   }
 
   private renderNow() {
-    const { canvas, ctx, data, maxPoints, maxLatency, stepX } = this;
+    const { canvas, ctx, data, maxLatency, stepX } = this;
     const w = canvas.width;
     const h = canvas.height;
-
     ctx.clearRect(0, 0, w, h);
 
-    if (maxPoints === 0) return;
+    if (data.length < 2) return;
 
-    // ── 网格背景（缓存成 ImageData 或复用路径） ─────────────────────
-    ctx.strokeStyle = "rgba(0, 212, 255, 0.04)";
-    ctx.lineWidth = 0.5;
-    for (let y = 0; y < 4; y++) {
-      const yy = (y / 4) * h;
-      ctx.beginPath();
-      ctx.moveTo(0, yy);
-      ctx.lineTo(w, yy);
-      ctx.stroke();
-    }
+    const yy = (val: number) => h - (val / maxLatency) * (h - 2) - 1;
 
-    // ── 计算所有点的坐标 ─────────────────────────────────────────────
-    const points: Array<{ x: number; y: number }> = [];
-    for (let i = 0; i < maxPoints; i++) {
-      const x = i * stepX;
-      const val = data[i] / maxLatency;
-      const y = h - val * (h - 2) - 1;
+    ctx.beginPath();
+    const points: { x: number; y: number }[] = [];
+    for (let i = 0; i < data.length; i++) {
+      const x = w - (data.length - 1 - i) * stepX;
+      const val = Math.min(data[i], maxLatency);
+      const y = yy(val);
       points.push({ x, y });
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
     }
 
-    // ── 主线条 ─────────────────────────────────────────────────────
-    // 缓存渐变（只创建一次）
-    if (!this.gradient) {
-      this.gradient = ctx.createLinearGradient(0, 0, w, 0);
-      this.gradient.addColorStop(0, "rgba(0, 212, 255, 0.2)");
-      this.gradient.addColorStop(0.5, "rgba(0, 245, 160, 0.6)");
-      this.gradient.addColorStop(1, "rgba(0, 245, 160, 0.9)");
-    }
-
-    ctx.strokeStyle = this.gradient;
-    ctx.lineWidth = 1.5;
-    ctx.lineJoin = "round";
-    ctx.lineCap = "round";
-    ctx.beginPath();
-    ctx.moveTo(points[0].x, points[0].y);
-    for (let i = 1; i < points.length; i++) {
-      ctx.lineTo(points[i].x, points[i].y);
-    }
-    ctx.stroke();
-
-    // ── 辉光层（更宽的半透明线） ─────────────────────────────────
-    if (!this.glowGradient) {
-      this.glowGradient = ctx.createLinearGradient(0, 0, w, 0);
-      this.glowGradient.addColorStop(0, "rgba(0, 212, 255, 0.05)");
-      this.glowGradient.addColorStop(1, "rgba(0, 245, 160, 0.15)");
-    }
     ctx.strokeStyle = this.glowGradient;
-    ctx.lineWidth = 4;
-    ctx.beginPath();
-    ctx.moveTo(points[0].x, points[0].y);
-    for (let i = 1; i < points.length; i++) {
-      ctx.lineTo(points[i].x, points[i].y);
-    }
+    ctx.lineWidth = 1.5;
     ctx.stroke();
 
-    // ── 末端亮点 ───────────────────────────────────────────────────
-    const last = points[maxPoints - 1];
-    if (data[maxPoints - 1] > 0) {
-      ctx.fillStyle = "#00f5a0";
-      ctx.shadowColor = "#00f5a0";
-      ctx.shadowBlur = 6;
+    if (points.length > 0) {
+      const last = points[points.length - 1];
       ctx.beginPath();
-      ctx.arc(last.x, last.y, 2.5, 0, Math.PI * 2);
+      ctx.arc(last.x, last.y, 3, 0, Math.PI * 2);
+      ctx.fillStyle = "#00f5a0";
       ctx.fill();
-      ctx.shadowBlur = 0;
     }
   }
 }
 
-// ─── Mini Widget Logic ────────────────────────────────────────────────
+// ─── Mini Widget ──────────────────────────────────────────────────────
 
 class MiniWidget {
   private latencyEl: HTMLElement;
@@ -187,380 +136,434 @@ class MiniWidget {
   private txEl: HTMLElement;
   private statusEl: HTMLElement;
   private graph: LatencyGraph;
-  private configBtn: HTMLElement;
-  private closeBtn: HTMLElement;
 
   constructor() {
     this.latencyEl = document.getElementById("metric-latency")!;
     this.rxEl = document.getElementById("metric-rx")!;
     this.txEl = document.getElementById("metric-tx")!;
     this.statusEl = document.getElementById("status-badge")!;
-    this.configBtn = document.getElementById("btn-config")!;
-    this.closeBtn = document.getElementById("btn-close")!;
 
     const canvas = document.getElementById(
       "latency-canvas",
     ) as HTMLCanvasElement;
     this.graph = new LatencyGraph(canvas, 30);
 
-    this.setupListeners();
-  }
-
-  private setupListeners() {
-    // 配置按钮：阻止冒泡防止拖拽触发
-    this.configBtn.addEventListener("mousedown", (e) => e.stopPropagation());
-    this.configBtn.addEventListener("click", () => {
+    document.getElementById("btn-config")!.addEventListener("click", () => {
       invoke("show_config_window").catch(console.error);
     });
-
-    // 关闭按钮：隐藏到系统托盘
-    this.closeBtn.addEventListener("mousedown", (e) => e.stopPropagation());
-    this.closeBtn.addEventListener("click", () => {
+    document.getElementById("btn-close")!.addEventListener("click", () => {
       getCurrentWindow().hide().catch(console.error);
     });
 
-    // 监听后端推送的隧道指标
     listen<TunnelMetric>("tunnel-metric", (event) => {
       this.update(event.payload);
     }).catch(console.error);
   }
 
   private update(metric: TunnelMetric) {
-    // 延时
     const lat = Math.round(metric.latency_ms);
     this.latencyEl.textContent = `${lat} ms`;
-
-    // 更新折线图
     this.graph.push(metric.latency_ms);
 
-    // 吞吐量 - 自动单位
     this.rxEl.textContent = formatBytes(metric.rx_bytes_per_sec);
     this.txEl.textContent = formatBytes(metric.tx_bytes_per_sec);
 
-    // 状态徽章
     const statusStr =
       typeof metric.status === "string" ? metric.status : "Error";
-
+    const statusMap: Record<string, string> = {
+      Connected: "已连接",
+      Connecting: "连接中…",
+      Disconnected: "未连接",
+      Error: "错误",
+    };
     this.statusEl.textContent = `\u25CF ${statusMap[statusStr] || statusStr}`;
     this.statusEl.className = "tunnel-status-badge";
-    if (statusStr === "Connected") {
-      this.statusEl.classList.add("connected");
-    } else if (statusStr === "Connecting") {
+    if (statusStr === "Connected") this.statusEl.classList.add("connected");
+    else if (statusStr === "Connecting")
       this.statusEl.classList.add("connecting");
-    } else if (statusStr === "Error") {
-      this.statusEl.classList.add("error");
-    } else {
-      this.statusEl.classList.add("disconnected");
-    }
+    else if (statusStr === "Error") this.statusEl.classList.add("error");
+    else this.statusEl.classList.add("disconnected");
   }
 }
 
-// ─── Config Panel Logic ───────────────────────────────────────────────
+// ─── Config Panel ─────────────────────────────────────────────────────
 
 class ConfigPanel {
-  private tunnelList: HTMLElement;
-  private noTunnelsMsg: HTMLElement;
-  private addBtn: HTMLElement;
-  private template: HTMLTemplateElement;
+  private area: HTMLElement;
+  private savedConfig: TunnelConfig | null = null;
+  private btnState: "stopped" | "starting" | "started" | "stopping" = "stopped";
 
   constructor() {
-    this.tunnelList = document.getElementById("tunnel-list")!;
-    this.noTunnelsMsg = document.getElementById("no-tunnels-msg")!;
-    this.addBtn = document.getElementById("btn-add-tunnel")!;
-    this.template = document.getElementById(
-      "tunnel-editor-template",
-    ) as HTMLTemplateElement;
-
-    this.addBtn.addEventListener("click", () => this.addTunnelEditor());
-    this.loadAndRender();
+    this.area = document.getElementById("tunnel-editor-area")!;
+    this.loadAndBuild();
+    this.listenStatus();
   }
 
-  private async loadAndRender() {
+  private async loadAndBuild() {
     try {
-      const tunnels: TunnelConfig[] = await invoke("get_tunnels");
-      this.renderTunnels(tunnels);
+      const appCfg: AppConfig = await invoke("get_config");
+      this.savedConfig = appCfg.tunnel;
     } catch (e) {
-      console.error("加载隧道配置失败:", e);
+      console.error("加载配置失败:", e);
     }
+    this.renderEditor(this.savedConfig || this.defaultConfig());
   }
 
-  private renderTunnels(tunnels: TunnelConfig[]) {
-    this.tunnelList.innerHTML = "";
-    if (tunnels.length === 0) {
-      this.tunnelList.appendChild(this.noTunnelsMsg);
-      return;
-    }
-    for (const tunnel of tunnels) {
-      this.renderTunnelEditor(tunnel);
-    }
-  }
-
-  private addTunnelEditor() {
-    const defaultConfig: TunnelConfig = {
-      id: crypto.randomUUID(),
-      name: "新建隧道",
-      ssh_host: "127.0.0.1",
+  private defaultConfig(): TunnelConfig {
+    return {
+      name: "SSH 隧道",
+      ssh_host: "",
       ssh_port: 22,
       ssh_user: "root",
       auth_method: { Password: { password: "" } },
-      local_port: 5432,
-      target_host: "127.0.0.1",
-      target_port: 5432,
-      enabled: false,
+      forwards: [
+        { local_port: 15432, target_host: "127.0.0.1", target_port: 15432 },
+      ],
     };
-    this.renderTunnelEditor(defaultConfig);
   }
 
-  private renderTunnelEditor(config: TunnelConfig) {
-    const clone = this.template.content.cloneNode(true) as DocumentFragment;
-    const editor = clone.firstElementChild as HTMLElement;
+  // ── build UI dynamically ──────────────────────────────────────────
 
-    const nameInput = editor.querySelector(".field-name") as HTMLInputElement;
-    const sshHostInput = editor.querySelector(
-      ".field-ssh-host",
-    ) as HTMLInputElement;
-    const sshPortInput = editor.querySelector(
-      ".field-ssh-port",
-    ) as HTMLInputElement;
-    const sshUserInput = editor.querySelector(
-      ".field-ssh-user",
-    ) as HTMLInputElement;
-    const authTypeSelect = editor.querySelector(
-      ".field-auth-type",
-    ) as HTMLSelectElement;
-    const passwordInput = editor.querySelector(
-      ".field-password",
-    ) as HTMLInputElement;
-    const keyPathInput = editor.querySelector(
-      ".field-key-path",
-    ) as HTMLInputElement;
-    const browseBtn = editor.querySelector(".btn-browse") as HTMLButtonElement;
-    const localPortInput = editor.querySelector(
-      ".field-local-port",
-    ) as HTMLInputElement;
-    const targetHostInput = editor.querySelector(
-      ".field-target-host",
-    ) as HTMLInputElement;
-    const targetPortInput = editor.querySelector(
-      ".field-target-port",
-    ) as HTMLInputElement;
-    const startBtn = editor.querySelector(
-      ".btn-start-tunnel",
-    ) as HTMLButtonElement;
-    const deleteBtn = editor.querySelector(
-      ".btn-delete-tunnel",
-    ) as HTMLButtonElement;
+  private renderEditor(cfg: TunnelConfig) {
+    const a = this.area;
+    a.innerHTML = "";
 
-    // 填充字段
-    nameInput.value = config.name;
-    sshHostInput.value = config.ssh_host;
-    sshPortInput.value = String(config.ssh_port);
-    sshUserInput.value = config.ssh_user;
+    // ── SSH section ──────────────────────────────────────────────────
+    const sshSection = el("div", { class: "tunnel-editor" });
 
-    const isKey = "Key" in config.auth_method;
-    authTypeSelect.value = isKey ? "key" : "password";
+    sshSection.appendChild(
+      el("input", {
+        class: "field-name",
+        placeholder: "隧道名称",
+        value: cfg.name,
+      }),
+    );
+    const grid = el("div", { class: "editor-grid" });
 
-    if (isKey) {
-      const k = config.auth_method as {
-        Key: { private_key_path: string; passphrase: string | null };
-      };
-      keyPathInput.value = k.Key.private_key_path;
-    } else {
-      const p = config.auth_method as { Password: { password: string } };
-      passwordInput.value = p.Password.password;
-    }
+    const sshHost = el("input", {
+      class: "field-ssh-host",
+      placeholder: "your-server.com",
+      value: cfg.ssh_host,
+    }) as HTMLInputElement;
+    grid.appendChild(lbl("SSH 主机", sshHost));
 
-    localPortInput.value = String(config.local_port);
-    targetHostInput.value = config.target_host;
-    targetPortInput.value = String(config.target_port);
+    const sshPort = el("input", {
+      class: "field-ssh-port",
+      type: "number",
+      value: String(cfg.ssh_port),
+    }) as HTMLInputElement;
+    grid.appendChild(lbl("端口", sshPort));
 
-    // 切换密码/密钥字段可见性
-    const toggleAuthFields = () => {
-      const isKeyMode = authTypeSelect.value === "key";
-      const pwLabel = passwordInput.closest("label");
-      const keyLabel = keyPathInput.closest("label");
-      if (pwLabel) pwLabel.style.display = isKeyMode ? "none" : "";
-      if (keyLabel) keyLabel.style.display = isKeyMode ? "" : "none";
+    const sshUser = el("input", {
+      class: "field-ssh-user",
+      placeholder: "root",
+      value: cfg.ssh_user,
+    }) as HTMLInputElement;
+    grid.appendChild(lbl("用户", sshUser));
+
+    const isKey = "Key" in cfg.auth_method;
+    const authType = el("select", {
+      class: "field-auth-type",
+    }) as HTMLSelectElement;
+    authType.innerHTML =
+      '<option value="password">密码</option><option value="key">私钥</option>';
+    authType.value = isKey ? "key" : "password";
+    grid.appendChild(lbl("认证方式", authType));
+
+    const pwInput = el("input", {
+      class: "field-password",
+      type: "password",
+      placeholder: "密码",
+    }) as HTMLInputElement;
+    if (!isKey) pwInput.value = (cfg.auth_method as any).Password.password;
+    const pwLabel = lbl("密码", pwInput);
+    grid.appendChild(pwLabel);
+
+    const keyRow = el("span", { class: "key-path-row" });
+    const keyInput = el("input", {
+      class: "field-key-path",
+      placeholder: "/path/to/id_rsa",
+    }) as HTMLInputElement;
+    if (isKey) keyInput.value = (cfg.auth_method as any).Key.private_key_path;
+    const browseBtn = el("button", { class: "btn-browse", text: "浏览" });
+    keyRow.appendChild(keyInput);
+    keyRow.appendChild(browseBtn);
+    const keyLabel = lbl("密钥路径", keyRow);
+    grid.appendChild(keyLabel);
+
+    // toggle auth fields
+    const toggleAuth = () => {
+      const km = authType.value === "key";
+      pwLabel.style.display = km ? "none" : "";
+      keyLabel.style.display = km ? "" : "none";
     };
-    toggleAuthFields();
-    authTypeSelect.addEventListener("change", toggleAuthFields);
+    toggleAuth();
+    authType.addEventListener("change", toggleAuth);
 
-    // 文件选择器：选择 SSH 私钥
     browseBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
       const selected = await open({
         multiple: false,
         title: "选择 SSH 私钥文件",
         filters: [
-          { name: "所有文件", extensions: ["*"] },
           {
             name: "SSH 密钥",
             extensions: ["pem", "key", "id_rsa", "id_ecdsa", "id_ed25519"],
           },
+          {
+            name: "所有文件",
+            extensions: ["*"],
+          },
         ],
       });
-      if (selected) {
-        keyPathInput.value = selected;
-      }
+      if (selected) keyInput.value = selected;
     });
 
-    // ── 启动/停止 状态机 ───────────────────────────────────────────
-    // btnState: "stopped" | "starting" | "started" | "stopping"
-    let btnState: string = "stopped";
-    const tunnelId = config.id;
+    sshSection.appendChild(grid);
 
+    // ── Forward rules section ────────────────────────────────────────
+    const fwdSection = el("div", { class: "forward-rules" });
+    const fwdLabel = el("div", { class: "forward-header" });
+    fwdLabel.innerHTML = "<span>端口转发规则</span>";
+    const addFwdBtn = el("button", {
+      class: "btn-add-forward",
+      text: "+ 添加",
+    });
+    fwdLabel.appendChild(addFwdBtn);
+    fwdSection.appendChild(fwdLabel);
+
+    const fwdList = el("div", { class: "forward-list" });
+
+    const renderForwards = () => {
+      fwdList.innerHTML = "";
+      for (let i = 0; i < cfg.forwards.length; i++) {
+        const fwd = cfg.forwards[i];
+        const row = el("div", { class: "forward-row" });
+
+        const lpInput = el("input", {
+          type: "number",
+          placeholder: "本地端口",
+          value: String(fwd.local_port),
+        }) as HTMLInputElement;
+        row.appendChild(lbl("本地", lpInput));
+
+        const thInput = el("input", {
+          placeholder: "目标主机",
+          value: fwd.target_host,
+        }) as HTMLInputElement;
+        row.appendChild(lbl("目标", thInput));
+
+        const tpInput = el("input", {
+          type: "number",
+          placeholder: "端口",
+          value: String(fwd.target_port),
+        }) as HTMLInputElement;
+        row.appendChild(lbl("端口", tpInput));
+
+        const delBtn = el("button", { class: "btn-delete-forward", text: "✕" });
+        delBtn.addEventListener("click", () => {
+          cfg.forwards.splice(i, 1);
+          renderForwards();
+        });
+        row.appendChild(delBtn);
+
+        // sync inputs to cfg
+        const sync = () => {
+          fwd.local_port = parseInt(lpInput.value) || 0;
+          fwd.target_host = thInput.value.trim();
+          fwd.target_port = parseInt(tpInput.value) || 0;
+        };
+        lpInput.addEventListener("input", sync);
+        thInput.addEventListener("input", sync);
+        tpInput.addEventListener("input", sync);
+
+        fwdList.appendChild(row);
+      }
+    };
+    renderForwards();
+
+    addFwdBtn.addEventListener("click", () => {
+      cfg.forwards.push({
+        local_port: 15432,
+        target_host: "127.0.0.1",
+        target_port: 15432,
+      });
+      renderForwards();
+    });
+
+    fwdSection.appendChild(fwdList);
+
+    // ── Action buttons ───────────────────────────────────────────────
+    const actions = el("div", { class: "editor-actions" });
+    const startBtn = el("button", {
+      class: "btn-start-tunnel",
+      text: "▶ 启动",
+    }) as HTMLButtonElement;
+
+    // build config from inputs
     const buildConfig = (): TunnelConfig => ({
-      id: tunnelId,
-      name: nameInput.value || "未命名",
-      ssh_host: sshHostInput.value.trim(),
-      ssh_port: parseInt(sshPortInput.value) || 22,
-      ssh_user: sshUserInput.value.trim() || "root",
+      name:
+        (sshSection.querySelector(".field-name") as HTMLInputElement).value ||
+        "未命名",
+      ssh_host: sshHost.value.trim(),
+      ssh_port: parseInt(sshPort.value) || 22,
+      ssh_user: sshUser.value.trim() || "root",
       auth_method:
-        authTypeSelect.value === "key"
+        authType.value === "key"
           ? {
               Key: {
-                private_key_path: keyPathInput.value.trim(),
+                private_key_path: keyInput.value.trim(),
                 passphrase: null,
               },
             }
-          : { Password: { password: passwordInput.value } },
-      local_port: parseInt(localPortInput.value) || 5432,
-      target_host: targetHostInput.value.trim() || "127.0.0.1",
-      target_port: parseInt(targetPortInput.value) || 5432,
-      enabled: true,
+          : { Password: { password: pwInput.value } },
+      forwards: cfg.forwards.filter(
+        (f) => f.local_port > 0 && f.local_port <= 65535,
+      ),
     });
 
-    const validate = (cfg: TunnelConfig): string[] => {
-      const errs: string[] = [];
-      if (!cfg.ssh_host) errs.push("SSH 主机不能为空");
-      if (!cfg.ssh_user) errs.push("SSH 用户不能为空");
-      if (cfg.ssh_port < 1 || cfg.ssh_port > 65535)
-        errs.push("SSH 端口无效 (1-65535)");
-      const isKeyMode = "Key" in cfg.auth_method;
-      if (!isKeyMode && !(cfg.auth_method as any).Password.password)
-        errs.push("密码不能为空");
-      if (isKeyMode && !(cfg.auth_method as any).Key.private_key_path)
-        errs.push("密钥路径不能为空");
-      if (cfg.local_port < 1 || cfg.local_port > 65535)
-        errs.push("本地端口无效 (1-65535)");
-      if (!cfg.target_host) errs.push("目标主机不能为空");
-      if (cfg.target_port < 1 || cfg.target_port > 65535)
-        errs.push("目标端口无效 (1-65535)");
-      return errs;
+    const validate = (c: TunnelConfig): string[] => {
+      const e: string[] = [];
+      if (!c.ssh_host) e.push("SSH 主机不能为空");
+      if (!c.ssh_user) e.push("SSH 用户不能为空");
+      if (c.ssh_port < 1 || c.ssh_port > 65535) e.push("SSH 端口无效");
+      if (
+        !("Key" in c.auth_method) &&
+        !(c.auth_method as any).Password.password
+      )
+        e.push("密码不能为空");
+      if (
+        "Key" in c.auth_method &&
+        !(c.auth_method as any).Key.private_key_path
+      )
+        e.push("密钥路径不能为空");
+      if (c.forwards.length === 0) e.push("至少需要一个转发规则");
+      return e;
     };
 
-    // ── 从 tunnel-metric 事件中提取状态字符串 ────────────────────
-    const extractStatus = (
-      m: TunnelMetric,
-    ): { status: string; error?: string } => {
-      if (typeof m.status === "string") return { status: m.status };
-      if (m.status && typeof m.status === "object" && "Error" in m.status) {
-        return { status: "Error", error: (m.status as any).Error };
-      }
-      return { status: "Disconnected" };
-    };
-
-    // ── 按钮 UI 更新 ───────────────────────────────────────────────
-    const setBtnStart = () => {
-      btnState = "stopped";
-      startBtn.textContent = "▶ 启动";
-      startBtn.className = "btn-start-tunnel";
-      startBtn.disabled = false;
-      deleteBtn.disabled = false;
-    };
-
-    const setBtnStarting = () => {
-      btnState = "starting";
-      startBtn.textContent = "⏳ 连接中…";
-      startBtn.disabled = true;
-      deleteBtn.disabled = true;
-    };
-
-    const setBtnStarted = () => {
-      btnState = "started";
-      startBtn.textContent = "⏹ 停止";
-      startBtn.className = "btn-stop-tunnel";
-      startBtn.disabled = false;
-      deleteBtn.disabled = true;
-    };
-
-    const setBtnStopping = () => {
-      btnState = "stopping";
-      startBtn.textContent = "⏳ 停止中…";
-      startBtn.disabled = true;
-      deleteBtn.disabled = true;
-    };
-
-    // ── 点击处理 ───────────────────────────────────────────────────
     startBtn.addEventListener("click", async () => {
-      if (btnState === "starting" || btnState === "stopping") return;
+      if (this.btnState === "starting" || this.btnState === "stopping") return;
 
-      if (btnState === "stopped") {
-        const cfg = buildConfig();
-        const errs = validate(cfg);
+      if (this.btnState === "stopped") {
+        const c = buildConfig();
+        const errs = validate(c);
         if (errs.length > 0) {
-          showToast("请修正以下问题", errs.join("\n"));
+          showToast("请修正", errs.join("\n"));
           return;
         }
 
-        setBtnStarting();
+        this.btnState = "starting";
+        startBtn.textContent = "⏳ 连接中…";
+        startBtn.disabled = true;
+        this.setEditingEnabled(false);
 
         try {
-          await invoke("start_tunnel", { config: cfg });
-          // 不立即切换按钮，等后端 Connected 事件再切
-          // 但如果 invoke 本身抛异常（权限、序列化等问题）
+          await invoke("save_config", { config: c });
+          await invoke("start_tunnel");
         } catch (e: any) {
-          setBtnStart();
+          this.setStopped(startBtn);
           showToast("启动失败", typeof e === "string" ? e : JSON.stringify(e));
         }
-      } else if (btnState === "started") {
-        setBtnStopping();
+      } else if (this.btnState === "started") {
+        this.btnState = "stopping";
+        startBtn.textContent = "⏳ 停止中…";
+        startBtn.disabled = true;
         try {
-          await invoke("stop_tunnel", { id: tunnelId });
+          await invoke("stop_tunnel");
         } catch (e: any) {
-          console.error("停止隧道失败:", e);
+          console.error("停止失败:", e);
         }
-        setBtnStart();
+        this.setStopped(startBtn);
       }
     });
 
-    // ── 监听后端状态事件，驱动按钮状态 ──────────────────────────────
-    const cfgName = config.name;
+    actions.appendChild(startBtn);
+    sshSection.appendChild(fwdSection);
+    sshSection.appendChild(actions);
+    a.appendChild(sshSection);
+  }
+
+  private setStopped(btn: HTMLButtonElement) {
+    this.btnState = "stopped";
+    btn.textContent = "▶ 启动";
+    btn.className = "btn-start-tunnel";
+    btn.disabled = false;
+    this.setEditingEnabled(true);
+  }
+
+  private setStarted(btn: HTMLButtonElement) {
+    this.btnState = "started";
+    btn.textContent = "⏹ 停止";
+    btn.className = "btn-stop-tunnel";
+    btn.disabled = false;
+    this.setEditingEnabled(false);
+  }
+
+  private setEditingEnabled(enabled: boolean) {
+    const els = this.area.querySelectorAll("input, select, button");
+    els.forEach((el) => {
+      // 不操作启动/停止按钮
+      if (
+        el.classList.contains("btn-start-tunnel") ||
+        el.classList.contains("btn-stop-tunnel")
+      )
+        return;
+      (el as HTMLInputElement).disabled = !enabled;
+    });
+  }
+
+  private listenStatus() {
     listen<TunnelMetric>("tunnel-metric", (event) => {
       const m = event.payload;
-      if (m.id !== tunnelId) return;
+      const status = typeof m.status === "string" ? m.status : "Error";
 
-      const { status, error } = extractStatus(m);
+      const btn = this.area.querySelector(
+        ".btn-start-tunnel, .btn-stop-tunnel",
+      ) as HTMLButtonElement;
+      if (!btn) return;
 
-      if (status === "Connected" && btnState === "starting") {
-        // SSH 连接成功，允许停止
-        setBtnStarted();
+      if (status === "Connected" && this.btnState !== "started") {
+        this.setStarted(btn);
+      } else if (status === "Error" && this.btnState === "starting") {
+        const errMsg =
+          typeof m.status === "object" && "Error" in m.status
+            ? (m.status as any).Error
+            : "";
+        this.setStopped(btn);
+        showToast("连接失败", errMsg || "请检查配置后重试");
+      } else if (status === "Error" && this.btnState === "started") {
+        this.setStopped(btn);
       } else if (
-        status === "Error" &&
-        (btnState === "starting" || btnState === "started")
+        status === "Disconnected" &&
+        (this.btnState === "starting" || this.btnState === "started")
       ) {
-        // 连接失败（密码错误等）→ 恢复启动按钮
-        setBtnStart();
-        showToast(`${cfgName} 连接失败`, error || "请检查配置后重试");
-      } else if (status === "Disconnected" && btnState === "started") {
-        // 意外断开
-        setBtnStart();
+        this.setStopped(btn);
       }
-    });
-
-    // 删除
-    deleteBtn.addEventListener("click", () => {
-      editor.remove();
-    });
-
-    this.noTunnelsMsg.style.display = "none";
-    this.tunnelList.appendChild(editor);
+    }).catch(console.error);
   }
 }
 
-// ─── Toast 通知 ───────────────────────────────────────────────────────
+// ─── DOM helpers ──────────────────────────────────────────────────────
 
-// 轻量级浮动通知，替代浏览器原生 alert
+function el(tag: string, attrs: Record<string, any> = {}): HTMLElement {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "text") e.textContent = v;
+    else if (k === "class") e.className = v;
+    else (e as any)[k] = v;
+  }
+  return e;
+}
+
+function lbl(text: string, child: HTMLElement): HTMLElement {
+  const l = el("label");
+  l.textContent = text;
+  l.appendChild(child);
+  return l;
+}
+
+// ─── Toast ────────────────────────────────────────────────────────────
+
 function showToast(title: string, message: string) {
   const existing = document.getElementById("tunnel-toast");
   if (existing) existing.remove();
@@ -570,16 +573,12 @@ function showToast(title: string, message: string) {
   toast.innerHTML = `<strong>${title}</strong><p>${message}</p>`;
   document.body.appendChild(toast);
 
-  // 3 秒后自动消失
   setTimeout(() => {
     toast.style.opacity = "0";
     setTimeout(() => toast.remove(), 300);
   }, 3000);
 
-  // 点击关闭
-  toast.addEventListener("click", () => {
-    toast.remove();
-  });
+  toast.addEventListener("click", () => toast.remove());
 }
 
 // ─── 拖拽实现 ──────────────────────────────────────────────────────────

@@ -64,7 +64,7 @@ body {
 }
 
 .widget-title {
-    font-size: 13px;
+    font-size: 14px;
     font-weight: 700;
     letter-spacing: 1.5px;
     text-transform: uppercase;
@@ -110,7 +110,7 @@ body {
 }
 
 .tunnel-status-badge {
-    font-size: 12px;
+    font-size: 13px;
     font-weight: 600;
     padding: 2px 10px;
     border-radius: 10px;
@@ -160,14 +160,14 @@ body {
 }
 
 .metric-label {
-    font-size: 10px;
+    font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 1px;
     color: var(--text-secondary);
 }
 
 .metric-value {
-    font-size: 14px;
+    font-size: 15px;
     font-weight: 700;
     color: var(--accent-green);
     text-shadow: var(--glow-green);
@@ -242,9 +242,9 @@ body {
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: var(--radius-sm);
     color: var(--text-primary);
-    padding: 6px 10px;
+    padding: 7px 10px;
     font-family: inherit;
-    font-size: 13px;
+    font-size: 14px;
     outline: none;
     width: 100%;
     transition: border-color 0.15s;
@@ -256,8 +256,15 @@ body {
     box-shadow: 0 0 4px rgba(0, 212, 255, 0.2);
 }
 
+.tunnel-editor input:disabled,
+.tunnel-editor select:disabled,
+.forward-row input:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
 .tunnel-editor .field-name {
-    font-size: 16px;
+    font-size: 18px;
     font-weight: 600;
     color: var(--text-primary);
     background: transparent;
@@ -276,11 +283,17 @@ body {
 .editor-grid label {
     display: flex;
     flex-direction: column;
-    font-size: 11px;
+    font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 0.8px;
     color: var(--text-secondary);
     gap: 4px;
+}
+
+/* 密码 / 密钥路径占满整行 */
+.editor-grid label:nth-child(5),
+.editor-grid label:nth-child(6) {
+    grid-column: 1 / -1;
 }
 
 .config-actions {
@@ -336,7 +349,7 @@ body {
     padding: 8px 18px;
     border-radius: var(--radius-sm);
     font-family: inherit;
-    font-size: 13px;
+    font-size: 14px;
     font-weight: 600;
     cursor: pointer;
     transition:
@@ -360,7 +373,7 @@ body {
     padding: 8px 18px;
     border-radius: var(--radius-sm);
     font-family: inherit;
-    font-size: 13px;
+    font-size: 14px;
     font-weight: 600;
     cursor: pointer;
     transition:
@@ -390,6 +403,111 @@ body {
 
 .btn-delete-tunnel:hover {
     background: rgba(255, 71, 87, 0.15);
+}
+
+/* ── Forward Rules Section ──────────────────────────────────────────── */
+.forward-rules {
+    margin-top: 8px;
+    border-top: 1px solid var(--border-color);
+    padding-top: 10px;
+}
+
+.forward-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+}
+
+.forward-header span {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-secondary);
+}
+
+.btn-add-forward {
+    background: rgba(0, 212, 255, 0.1);
+    border: 1px solid rgba(0, 212, 255, 0.25);
+    color: var(--accent-cyan);
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+
+.btn-add-forward:hover {
+    background: rgba(0, 212, 255, 0.2);
+}
+
+.forward-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.forward-row {
+    display: flex;
+    gap: 6px;
+    align-items: flex-end;
+}
+
+.forward-row label {
+    display: flex;
+    flex-direction: column;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--text-secondary);
+    gap: 2px;
+}
+
+/* 1-2-1 ratio: 本地端口 : 目标主机 : 目标端口 */
+.forward-row label:nth-child(1) {
+    flex: 1;
+}
+.forward-row label:nth-child(2) {
+    flex: 2;
+}
+.forward-row label:nth-child(3) {
+    flex: 1;
+}
+
+.forward-row input {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    padding: 4px 6px;
+    font-family: inherit;
+    font-size: 13px;
+    outline: none;
+    width: 100%;
+    transition: border-color 0.15s;
+}
+
+.forward-row input:focus {
+    border-color: var(--accent-cyan);
+}
+
+.btn-delete-forward {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 14px;
+    cursor: pointer;
+    padding: 4px 6px;
+    border-radius: var(--radius-sm);
+    transition: color 0.15s;
+    line-height: 1;
+    margin-bottom: 2px;
+}
+
+.btn-delete-forward:hover {
+    color: var(--accent-red);
+    background: rgba(255, 71, 87, 0.1);
 }
 
 /* ── Toast 通知 ──────────────────────────────────────────────────── */
