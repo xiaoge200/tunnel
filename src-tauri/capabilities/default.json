@@ -1,0 +1,21 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability for Tunnel",
+  "windows": ["mini_widget", "config_panel"],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-focus",
+    "core:window:allow-is-visible",
+    "core:event:default",
+    "core:event:allow-emit",
+    "core:event:allow-listen",
+    "opener:default",
+    "dialog:default"
+  ]
+}

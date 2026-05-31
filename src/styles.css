@@ -1,0 +1,486 @@
+/* ── Reset & Global ───────────────────────────────────────────────── */
+*,
+*::before,
+*::after {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+:root {
+    --bg-primary: #0a0c12;
+    --bg-secondary: rgba(18, 22, 34, 0.95);
+    --bg-card: rgba(24, 30, 44, 0.9);
+    --text-primary: #d0d8e8;
+    --text-secondary: #7a8aa0;
+    --accent-green: #00f5a0;
+    --accent-cyan: #00d4ff;
+    --accent-yellow: #f5c542;
+    --accent-red: #ff4757;
+    --border-color: rgba(0, 212, 255, 0.15);
+    --glow-green: 0 0 8px rgba(0, 245, 160, 0.3);
+    --glow-cyan: 0 0 8px rgba(0, 212, 255, 0.25);
+    --radius-sm: 6px;
+    --radius-md: 10px;
+    --radius-lg: 14px;
+    font-family: "SF Mono", "Cascadia Code", "Fira Code", "Consolas", monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-primary);
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+html,
+body {
+    height: 100%;
+    overflow: hidden;
+    background: transparent;
+}
+
+/* ── Mini Widget View ─────────────────────────────────────────────── */
+/* data-tauri-drag-region 放在 .widget-container 上，整个区域可拖拽。   */
+/* 按钮通过 JS 的 stopPropagation 阻止 mousedown 冒泡，避免误触拖拽。 */
+.widget-container {
+    width: 340px;
+    height: 200px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-shadow:
+        0 0 20px rgba(0, 0, 0, 0.6),
+        inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.widget-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px 6px;
+    flex-shrink: 0;
+}
+
+.widget-title {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--accent-cyan);
+    text-shadow: var(--glow-cyan);
+}
+
+.widget-controls {
+    display: flex;
+    gap: 4px;
+}
+
+.ctrl-btn {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 15px;
+    cursor: pointer;
+    padding: 3px 6px;
+    border-radius: var(--radius-sm);
+    transition: color 0.15s ease;
+    line-height: 1;
+}
+
+.ctrl-btn:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.06);
+}
+
+/* ── Status & Metrics ─────────────────────────────────────────────── */
+.widget-body {
+    padding: 6px 14px 10px;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.status-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.tunnel-status-badge {
+    font-size: 12px;
+    font-weight: 600;
+    padding: 2px 10px;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-secondary);
+}
+
+.tunnel-status-badge.connected {
+    color: var(--accent-green);
+    text-shadow: var(--glow-green);
+}
+
+.tunnel-status-badge.connecting {
+    color: var(--accent-yellow);
+    animation: pulse 1.2s ease-in-out infinite;
+}
+
+.tunnel-status-badge.error {
+    color: var(--accent-red);
+}
+
+.tunnel-status-badge.disconnected {
+    color: var(--text-secondary);
+}
+
+@keyframes pulse {
+    0%,
+    100% {
+        opacity: 0.6;
+    }
+    50% {
+        opacity: 1;
+    }
+}
+
+.metrics-row {
+    display: flex;
+    gap: 10px;
+    justify-content: space-between;
+}
+
+.metric-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+}
+
+.metric-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-secondary);
+}
+
+.metric-value {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--accent-green);
+    text-shadow: var(--glow-green);
+    font-variant-numeric: tabular-nums;
+}
+
+/* ── Canvas ───────────────────────────────────────────────────────── */
+.canvas-wrapper {
+    flex: 1;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    border-radius: var(--radius-sm);
+    background: rgba(0, 0, 0, 0.25);
+    overflow: hidden;
+    margin-top: 2px;
+}
+
+#latency-canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+/* ── Config Panel View ────────────────────────────────────────────── */
+.config-panel {
+    width: 100%;
+    height: 100%;
+    background: var(--bg-secondary);
+    display: flex;
+    flex-direction: column;
+    padding: 16px;
+}
+
+.config-header h2 {
+    font-size: 17px;
+    font-weight: 600;
+    color: var(--accent-cyan);
+    letter-spacing: 1px;
+    margin-bottom: 16px;
+}
+
+.config-body {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+#no-tunnels-msg {
+    color: var(--text-secondary);
+    font-size: 14px;
+    text-align: center;
+    padding: 32px;
+}
+
+.tunnel-editor {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.tunnel-editor input,
+.tunnel-editor select {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    padding: 6px 10px;
+    font-family: inherit;
+    font-size: 13px;
+    outline: none;
+    width: 100%;
+    transition: border-color 0.15s;
+}
+
+.tunnel-editor input:focus,
+.tunnel-editor select:focus {
+    border-color: var(--accent-cyan);
+    box-shadow: 0 0 4px rgba(0, 212, 255, 0.2);
+}
+
+.tunnel-editor .field-name {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-primary);
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid var(--border-color);
+    border-radius: 0;
+    padding: 6px 0;
+}
+
+.editor-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+}
+
+.editor-grid label {
+    display: flex;
+    flex-direction: column;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--text-secondary);
+    gap: 4px;
+}
+
+.config-actions {
+    display: flex;
+    justify-content: center;
+    padding: 8px 0;
+}
+
+.btn-primary {
+    background: linear-gradient(
+        135deg,
+        rgba(0, 212, 255, 0.15),
+        rgba(0, 245, 160, 0.1)
+    );
+    border: 1px solid var(--accent-cyan);
+    color: var(--accent-cyan);
+    padding: 10px 24px;
+    border-radius: var(--radius-md);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition:
+        background 0.2s,
+        box-shadow 0.2s;
+    letter-spacing: 1px;
+}
+
+.btn-primary:hover {
+    background: linear-gradient(
+        135deg,
+        rgba(0, 212, 255, 0.25),
+        rgba(0, 245, 160, 0.2)
+    );
+    box-shadow: var(--glow-cyan);
+}
+
+.editor-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    padding-top: 4px;
+}
+
+.btn-start-tunnel {
+    background: linear-gradient(
+        135deg,
+        rgba(0, 245, 160, 0.12),
+        rgba(0, 212, 255, 0.08)
+    );
+    border: 1px solid var(--accent-green);
+    color: var(--accent-green);
+    padding: 8px 18px;
+    border-radius: var(--radius-sm);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition:
+        background 0.2s,
+        box-shadow 0.2s;
+}
+
+.btn-start-tunnel:hover {
+    background: linear-gradient(
+        135deg,
+        rgba(0, 245, 160, 0.2),
+        rgba(0, 212, 255, 0.15)
+    );
+    box-shadow: var(--glow-green);
+}
+
+.btn-stop-tunnel {
+    background: rgba(255, 200, 0, 0.08);
+    border: 1px solid var(--accent-yellow);
+    color: var(--accent-yellow);
+    padding: 8px 18px;
+    border-radius: var(--radius-sm);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition:
+        background 0.2s,
+        box-shadow 0.2s;
+}
+
+.btn-stop-tunnel:hover {
+    background: rgba(255, 200, 0, 0.15);
+    box-shadow: 0 0 8px rgba(245, 197, 66, 0.3);
+}
+
+.btn-delete-tunnel {
+    background: rgba(255, 71, 87, 0.08);
+    border: 1px solid rgba(255, 71, 87, 0.3);
+    color: var(--accent-red);
+    padding: 8px 18px;
+    border-radius: var(--radius-sm);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition:
+        background 0.2s,
+        border-color 0.2s;
+}
+
+.btn-delete-tunnel:hover {
+    background: rgba(255, 71, 87, 0.15);
+}
+
+/* ── Toast 通知 ──────────────────────────────────────────────────── */
+#tunnel-toast {
+    position: fixed;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #1a1e2e;
+    border: 1px solid rgba(255, 71, 87, 0.4);
+    border-radius: var(--radius-md);
+    padding: 12px 18px;
+    max-width: 280px;
+    z-index: 9999;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.6);
+    cursor: pointer;
+    transition: opacity 0.3s ease;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+#tunnel-toast strong {
+    color: var(--accent-red);
+    display: block;
+    margin-bottom: 4px;
+    font-size: 13px;
+}
+
+#tunnel-toast p {
+    color: var(--text-primary);
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+/* ── 密钥路径行（输入框 + 浏览按钮） ────────────────────────────── */
+.key-path-row {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+}
+
+.key-path-row input {
+    flex: 1;
+    min-width: 0;
+}
+
+.btn-browse {
+    background: rgba(0, 212, 255, 0.1);
+    border: 1px solid rgba(0, 212, 255, 0.25);
+    color: var(--accent-cyan);
+    padding: 6px 10px;
+    border-radius: var(--radius-sm);
+    font-family: inherit;
+    font-size: 11px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.15s;
+    flex-shrink: 0;
+}
+
+.btn-browse:hover {
+    background: rgba(0, 212, 255, 0.2);
+}
+
+/* ── 隐藏 Number 输入框上下箭头 ──────────────────────────────────── */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+input[type="number"] {
+    -moz-appearance: textfield;
+    appearance: textfield;
+}
+
+/* ── Scrollbar ────────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+    width: 4px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 2px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.2);
+}
