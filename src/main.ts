@@ -605,6 +605,18 @@ function setupDragAndButtons(root: HTMLElement) {
 
 // ─── App Entry ────────────────────────────────────────────────────────
 
+// 1. 顶层防御：用最快速度（最高优先级）卡死全局右键和手势缩放
+window.addEventListener("contextmenu", (e) => e.preventDefault(), {
+  capture: true,
+});
+window.addEventListener(
+  "wheel",
+  (e) => {
+    if (e.ctrlKey) e.preventDefault();
+  },
+  { passive: false },
+);
+
 window.addEventListener("DOMContentLoaded", () => {
   const win = getCurrentWindow();
   const label = win.label;

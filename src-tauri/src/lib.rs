@@ -236,9 +236,27 @@ pub fn run() {
             let mini = app.get_webview_window("mini_widget").unwrap();
             let mini_clone = mini.clone();
             mini.on_window_event(move |event| {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let _ = mini_clone.hide();
+                match event {
+                    // 1. 拦截关闭信号，改为隐藏
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        let _ = mini_clone.hide();
+                    }
+                    // 2. 捕获多屏缩放率改变
+                    tauri::WindowEvent::ScaleFactorChanged { .. } => {
+                        let w = mini_clone.clone();
+                        tauri::async_runtime::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            if let Ok(size) = w.inner_size() {
+                                let _ = w.set_size(size);
+                                #[cfg(target_os = "windows")]
+                                {
+                                    let _ = w.set_decorations(false);
+                                }
+                            }
+                        });
+                    }
+                    _ => {}
                 }
             });
 
