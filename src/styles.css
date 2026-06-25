@@ -510,6 +510,17 @@ body {
     background: rgba(255, 71, 87, 0.1);
 }
 
+/* ── 版本号 ────────────────────────────────────────────────────────── */
+.config-version {
+    text-align: center;
+    font-size: 11px;
+    color: var(--text-secondary);
+    opacity: 0.5;
+    padding-top: 8px;
+    border-top: 1px solid var(--border-color);
+    margin-top: auto;
+}
+
 /* ── Toast 通知 ──────────────────────────────────────────────────── */
 #tunnel-toast {
     position: fixed;

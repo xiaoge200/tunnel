@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
 import { open } from "@tauri-apps/plugin-dialog";
 
 // ─── Types ────────────────────────────────────────────────────────────
@@ -481,6 +482,17 @@ class ConfigPanel {
     sshSection.appendChild(fwdSection);
     sshSection.appendChild(actions);
     a.appendChild(sshSection);
+
+    // ── 版本号 ─────────────────────────────────────────────────────
+    const versionEl = el("div", { class: "config-version" });
+    getVersion()
+      .then((v) => {
+        versionEl.textContent = `v${v}`;
+      })
+      .catch(() => {
+        versionEl.textContent = "v0.1.0";
+      });
+    a.appendChild(versionEl);
   }
 
   private setStopped(btn: HTMLButtonElement) {
