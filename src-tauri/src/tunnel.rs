@@ -339,46 +339,27 @@ impl TunnelRuntime {
 
 // ─── 端口绑定辅助函数 ──────────────────────────────────────────────────
 
-/// 绑定本地端口，带 SO_REUSEADDR 和重试逻辑。
-/// 确保休眠唤醒后旧监听器尚未完全释放端口时也能尽快重新绑定。
+/// 绑定本地端口，带重试逻辑。
+/// 不使用 SO_REUSEADDR，因为 Windows 下该选项会导致多个 socket
+/// 同时绑定到同一端口，连接会随机分配到旧的（已失效）监听器。
 async fn bind_local_port(port: u16) -> std::io::Result<TcpListener> {
     let addr = format!("127.0.0.1:{}", port);
-    let sock_addr: std::net::SocketAddr = addr
-        .parse()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-
     for attempt in 0..5 {
-        // 用 socket2 创建 socket 并设置 SO_REUSEADDR，
-        // 这样旧 socket 关闭后可以立刻重用端口
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )?;
-
-        // SO_REUSEADDR：允许快速重用 TIME_WAIT / 刚关闭的端口
-        let _ = socket.set_reuse_address(true);
-
-        let sa = socket2::SockAddr::from(sock_addr);
-        if let Err(e) = socket.bind(&sa) {
-            drop(socket);
-            if attempt < 4 {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
+        match TcpListener::bind(&addr).await {
+            Ok(l) => return Ok(l),
+            Err(e) => {
+                if attempt < 4 {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                return Err(e);
             }
-            return Err(e);
         }
-
-        socket.listen(128)?;
-
-        // 将 std 的 TcpListener 转换为 tokio 的 TcpListener
-        let std_listener: std::net::TcpListener = socket.into();
-        return TcpListener::from_std(std_listener);
     }
-
+    // unreachable, but compiler needs a return
     Err(std::io::Error::new(
-        std::io::ErrorKind::AddrInUse,
-        format!("port {} bind failed after retries", port),
+        std::io::ErrorKind::Other,
+        "unreachable",
     ))
 }
 
