@@ -1,0 +1,166 @@
+# release.yml — 打 tag 后自动构建并发布(Windows)
+# 触发:git tag v0.1.0 → git push origin v0.1.0
+#   (或 workflow_dispatch:tag 不存在时基于当前提交创建)
+# 版本号:tauri.conf.json / Cargo.toml / package.json 三处保持一致后打 tag。
+# 流程:build job 只产 artifact(不碰 Release)→ release job 汇总产物、
+#   创建草稿 Release 并上传(重跑/移动 tag 幂等;手动发版去 GitHub 点 Publish)。
+# 产物:NSIS 安装包(免管理员)+ MSI(productName 为 ASCII "Tunnel",无 WiX 中文代码页问题)
+# Secrets:无需任何 secrets;如需后续接入 updater 签名再补 TAURI_SIGNING_PRIVATE_KEY(_PASSWORD)。
+# 未来加 macOS/Linux:扩展 matrix include + 对应系统依赖安装即可(参考本项目早期讨论)。
+
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.platform }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            label: windows
+            args: '--bundles nsis,msi'
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Verify version consistency
+        shell: bash
+        run: |
+          CFG=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          PKG=$(node -p "require('./package.json').version")
+          CARGO=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
+          echo "tauri.conf.json=$CFG  package.json=$PKG  Cargo.toml=$CARGO"
+          if [ "$CFG" != "$PKG" ] || [ "$CFG" != "$CARGO" ]; then
+            echo "::warning::三处版本号不一致,Release 以 tauri.conf.json ($CFG) 为准,请确认 tag 是否匹配"
+          fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # 只构建不发布:不传 tagName,tauri-action 不创建/上传 Release
+      # (beforeBuildCommand 会先跑 npm run build 产出 dist/)
+      - name: Build Windows bundles
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: ${{ matrix.args }}
+
+      # 汇总 bundle 产物 → 供 release job 下载
+      - name: Stage bundle outputs
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          find src-tauri/target -path '*/bundle/*' -type f \
+            \( -name '*.exe' -o -name '*.msi' \) \
+            -exec cp -f {} release-assets/ \;
+          echo "=== Staged assets ==="
+          ls -la release-assets/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: bundle-${{ matrix.label }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+
+      - name: Prepare release metadata
+        id: meta
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          cat >> "$GITHUB_OUTPUT" <<EOF
+          RELEASE_BODY<<GITCLIFF_EOF
+          ## Tunnel v${VERSION}
+
+          本版本由 GitHub Actions 自动构建(Windows 10/11 x64)。
+
+          - **NSIS 安装包**:\`Tunnel_${VERSION}_x64-setup.exe\`(免管理员安装,推荐)
+          - **MSI**:\`Tunnel_${VERSION}_x64.msi\`(适合企业批量部署)
+
+          > 程序未做代码签名,首次运行 SmartScreen 提示时点「更多信息 → 仍要运行」即可。
+          > 源码可审计,详见 [README](../README.md)。
+          GITCLIFF_EOF
+          EOF
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: assets
+
+      # 未来加入 macOS/Linux 后:按平台加前缀(01-Win/02-macOS/03-Linux)保证
+      # Releases 页分组顺序,并同步扩展上面的 RELEASE_BODY。
+      - name: Collect ordered assets
+        shell: bash
+        run: |
+          mkdir -p ordered-assets
+          for f in assets/*/*; do
+            [ -f "$f" ] || continue
+            cp -f "$f" "ordered-assets/$(basename "$f")"
+          done
+          echo "=== Ordered assets ==="
+          ls -la ordered-assets/
+
+      # 创建草稿 Release 并上传(overwrite 默认开,重跑/移动 tag 幂等)
+      - name: Create draft release & upload assets
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          # workflow_dispatch 触发时 tag 尚不存在,基于当前提交创建
+          target_commitish: ${{ github.sha }}
+          name: Tunnel v${{ steps.meta.outputs.version }}
+          body: ${{ steps.meta.outputs.RELEASE_BODY }}
+          draft: true
+          prerelease: false
+          preserve_order: true
+          files: ordered-assets/*
+          fail_on_unmatched_files: false

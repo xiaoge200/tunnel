@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use russh::client::{self, Handler};
 use russh::*;
 use russh_keys::load_secret_key;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,9 +34,49 @@ impl Handler for SshClientHandler {
 
 // ─── Tunnel Runtime ───────────────────────────────────────────────────
 
+type RunningMap = Mutex<HashMap<String, RunningTunnel>>;
+
+/// 状态发布唯一通道(与 manager 共享 running 表):更新状态表 →
+/// emit 事件 → 刷新托盘。1Hz 指标 tick 不走这里(见 run),防止每秒
+/// 重建托盘菜单。调用方不得持有 config/running 锁。
+async fn publish_metric(running: &Arc<RunningMap>, app: &AppHandle, metric: &TunnelMetric) {
+    {
+        let mut map = running.lock().await;
+        if let Some(e) = map.get_mut(&metric.id) {
+            e.status = metric.status.clone();
+            e.name = metric.name.clone();
+        }
+    }
+    let _ = app.emit("tunnel-metric", metric);
+    let _ = crate::refresh_tray(app).await;
+}
+
+/// runtime 退出后摘除注册;用 stopped 指针校验,过期 runtime 不会
+/// 误删同 id 的新 runtime。调用方不得持有 running 锁。
+async fn unregister_runtime(
+    running: &Arc<RunningMap>,
+    app: &AppHandle,
+    id: &str,
+    stopped: &Arc<AtomicBool>,
+) {
+    {
+        let mut map = running.lock().await;
+        if let Some(e) = map.get(id) {
+            if Arc::ptr_eq(&e.stopped, stopped) {
+                map.remove(id);
+            }
+        }
+    }
+    let _ = crate::refresh_tray(app).await;
+}
+
+/// 一次运行尝试:一条 SSH 连接 + 全部转发监听。
+/// 结束(用户停止 / SSH 断开 / 连接失败)时先发布终态,再由 runner 任务
+/// 调 `unregister_runtime` 摘除注册。
 struct TunnelRuntime {
     config: TunnelConfig,
     app_handle: AppHandle,
+    running: Arc<RunningMap>,
     stopped: Arc<AtomicBool>,
     rx_bytes: Arc<AtomicU64>,
     tx_bytes: Arc<AtomicU64>,
@@ -44,10 +85,11 @@ struct TunnelRuntime {
 }
 
 impl TunnelRuntime {
-    fn new(config: TunnelConfig, app_handle: AppHandle) -> Self {
+    fn new(config: TunnelConfig, app_handle: AppHandle, running: Arc<RunningMap>) -> Self {
         Self {
             config,
             app_handle,
+            running,
             stopped: Arc::new(AtomicBool::new(false)),
             rx_bytes: Arc::new(AtomicU64::new(0)),
             tx_bytes: Arc::new(AtomicU64::new(0)),
@@ -56,234 +98,157 @@ impl TunnelRuntime {
         }
     }
 
-    fn emit_status(&self, status: TunnelStatus) {
+    /// 状态转换统一走 publish(更新状态表 → emit 事件 → 刷新托盘),
+    /// 前端与托盘从同一事实源取状态。1Hz 指标 tick 不走这里(见 run)。
+    async fn publish_status(&self, status: TunnelStatus) {
         let metric = TunnelMetric {
+            id: self.config.id.clone(),
             name: self.config.name.clone(),
             status,
-            latency_ms: 0.0,
             rx_bytes_per_sec: 0.0,
             tx_bytes_per_sec: 0.0,
         };
-        let _ = self.app_handle.emit("tunnel-metric", &metric);
+        publish_metric(&self.running, &self.app_handle, &metric).await;
     }
 
-    /// 核心入口：包含自动重连循环。
-    /// SSH 意外断开时会自动清理旧会话、等待、重试，
-    /// 直到用户主动停止。
     pub async fn run(self: Arc<Self>) {
         if self.config.forwards.is_empty() {
-            log::warn!("No forwards configured, nothing to do");
+            log::warn!(
+                "Tunnel '{}' has no forwards configured, nothing to do",
+                self.config.name
+            );
+            self.publish_status(TunnelStatus::Disconnected).await;
             return;
         }
 
+        self.publish_status(TunnelStatus::Connecting).await;
+
         let ssh_addr = format!("{}:{}", self.config.ssh_host, self.config.ssh_port);
 
-        // ─── 外层重连循环 ──────────────────────────────────────────
-        'retry: loop {
-            if self.stopped.load(Ordering::Relaxed) {
-                break;
-            }
-
-            // ── 连接阶段 ────────────────────────────────────────────
-            self.emit_status(TunnelStatus::Connecting);
-            crate::set_tray_icon(&self.app_handle, TunnelStatus::Connecting);
-
-            let handle = match self.build_session(&ssh_addr).await {
-                Ok(h) => Arc::new(h),
-                Err(e) => {
-                    log::error!(
-                        "Tunnel '{}' SSH connection failed: {:#}",
-                        self.config.name,
-                        e
-                    );
-                    self.sleep_with_stop_check(Duration::from_secs(5)).await;
-                    continue;
+        // Build SSH session
+        let handle = match self.build_session(&ssh_addr).await {
+            Ok(h) => h,
+            Err(e) => {
+                log::error!(
+                    "Tunnel '{}' SSH connection failed: {:#}",
+                    self.config.name,
+                    e
+                );
+                // 用户在连接期间点了停止:按正常断开处理,不闪红
+                if self.stopped.load(Ordering::Relaxed) {
+                    self.publish_status(TunnelStatus::Disconnected).await;
+                } else {
+                    self.publish_status(TunnelStatus::Error(format!("{:#}", e))).await;
                 }
-            };
-
-            // ── 会话级取消标记：断开重连时终止旧监听器 ────────────
-            let session_cancel = Arc::new(AtomicBool::new(false));
-
-            // ── SSH 断线检测 ───────────────────────────────────────
-            let disconnect_notify = Arc::new(Notify::new());
-            let watcher_handle = handle.clone();
-            let watcher_notify = disconnect_notify.clone();
-            let watcher_stopped = self.stopped.clone();
-            let watcher_cancel = session_cancel.clone();
-            tokio::spawn(async move {
-                loop {
-                    if watcher_stopped.load(Ordering::Relaxed)
-                        || watcher_cancel.load(Ordering::Relaxed)
-                    {
-                        return;
-                    }
-                    if watcher_handle.is_closed() {
-                        watcher_notify.notify_one();
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            });
-
-            // ── 重置计数器，每次新会话从零开始 ─────────────────────
-            self.rx_bytes.store(0, Ordering::Relaxed);
-            self.tx_bytes.store(0, Ordering::Relaxed);
-            self.last_rx.store(0, Ordering::Relaxed);
-            self.last_tx.store(0, Ordering::Relaxed);
-
-            // ── 先绑定所有端口（同步），任何一个失败就重试 ─────────
-            //     这样可以避免旧监听器尚未释放端口时静默失败的问题。
-            let mut bound_listeners: Vec<(ForwardRule, TcpListener)> = Vec::new();
-            let mut bind_ok = true;
-
-            for fwd in &self.config.forwards {
-                match bind_local_port(fwd.local_port).await {
-                    Ok(listener) => {
-                        bound_listeners.push((fwd.clone(), listener));
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "Tunnel '{}' port {} bind failed: {}",
-                            self.config.name,
-                            fwd.local_port,
-                            e
-                        );
-                        bind_ok = false;
-                        break;
-                    }
-                }
-            }
-
-            if !bind_ok {
-                // 释放已经绑定的端口，确保下次重试时干净
-                drop(bound_listeners);
-                // SSH 会话也用不上了，放弃
-                drop(handle);
-                // 通知前端，让用户看到连接失败
-                self.emit_status(TunnelStatus::Connecting);
-                crate::set_tray_icon(&self.app_handle, TunnelStatus::Connecting);
-                // 等一会儿再重试，给旧监听器足够时间释放端口
-                self.sleep_with_stop_check(Duration::from_secs(3)).await;
-                continue 'retry;
-            }
-
-            // ── 端口全部绑定成功，启动前向监听器任务 ───────────────
-            for (fwd, listener) in bound_listeners {
-                let task_handle = handle.clone();
-                let task_stopped = self.stopped.clone();
-                let task_cancel = session_cancel.clone();
-                let task_rx = self.rx_bytes.clone();
-                let task_tx = self.tx_bytes.clone();
-                let target_host = fwd.target_host.clone();
-                let target_port = fwd.target_port;
-                let local_port = fwd.local_port;
-                let name = self.config.name.clone();
-
-                tokio::spawn(async move {
-                    run_forward_listener(
-                        task_handle,
-                        task_stopped,
-                        task_cancel,
-                        task_rx,
-                        task_tx,
-                        &name,
-                        local_port,
-                        listener,
-                        &target_host,
-                        target_port,
-                    )
-                    .await;
-                });
-            }
-
-            // ── 指标发射器 ─────────────────────────────────────────
-            let metric_stopped = self.stopped.clone();
-            let metric_cancel = session_cancel.clone();
-            let metric_cfg = self.config.clone();
-            let metric_ah = self.app_handle.clone();
-            let metric_rx = self.rx_bytes.clone();
-            let metric_tx = self.tx_bytes.clone();
-            let metric_last_rx = self.last_rx.clone();
-            let metric_last_tx = self.last_tx.clone();
-            tokio::spawn(async move {
-                loop {
-                    if metric_stopped.load(Ordering::Relaxed)
-                        || metric_cancel.load(Ordering::Relaxed)
-                    {
-                        return;
-                    }
-                    tokio::time::sleep(METRIC_EMIT_INTERVAL).await;
-                    if metric_stopped.load(Ordering::Relaxed)
-                        || metric_cancel.load(Ordering::Relaxed)
-                    {
-                        return;
-                    }
-
-                    let current_rx = metric_rx.load(Ordering::Relaxed);
-                    let current_tx = metric_tx.load(Ordering::Relaxed);
-                    let prev_rx = metric_last_rx.swap(current_rx, Ordering::Relaxed);
-                    let prev_tx = metric_last_tx.swap(current_tx, Ordering::Relaxed);
-
-                    let metric = TunnelMetric {
-                        name: metric_cfg.name.clone(),
-                        status: TunnelStatus::Connected,
-                        latency_ms: 0.0,
-                        rx_bytes_per_sec: (current_rx.saturating_sub(prev_rx)) as f64,
-                        tx_bytes_per_sec: (current_tx.saturating_sub(prev_tx)) as f64,
-                    };
-                    let _ = metric_ah.emit("tunnel-metric", &metric);
-                }
-            });
-
-            log::info!(
-                "Tunnel '{}' started with {} forward(s) via {}",
-                self.config.name,
-                self.config.forwards.len(),
-                ssh_addr
-            );
-            self.emit_status(TunnelStatus::Connected);
-            crate::set_tray_icon(&self.app_handle, TunnelStatus::Connected);
-
-            // ── 等待用户停止或 SSH 断线 ───────────────────────────
-            let is_disconnected = {
-                tokio::select! {
-                    _ = self.wait_until_stopped() => {
-                        log::info!("Tunnel '{}' stopped by user", self.config.name);
-                        false
-                    }
-                    _ = disconnect_notify.notified() => {
-                        log::warn!("Tunnel '{}' SSH connection lost, reconnecting...", self.config.name);
-                        true
-                    }
-                }
-            };
-
-            // ── 清理旧会话（通知所有子任务退出） ───────────────────
-            session_cancel.store(true, Ordering::Relaxed);
-
-            if !is_disconnected {
-                break; // 用户主动停止，退出外层重连循环
-            }
-
-            // 断开重连前等几秒，避免频繁重试
-            self.sleep_with_stop_check(Duration::from_secs(5)).await;
-        }
-
-        // ── 最终清理 ───────────────────────────────────────────────
-        self.emit_status(TunnelStatus::Disconnected);
-        crate::set_tray_icon(&self.app_handle, TunnelStatus::Disconnected);
-    }
-
-    /// 可被停止信号打断的 sleep：让停止响应更及时
-    async fn sleep_with_stop_check(&self, duration: Duration) {
-        let step = Duration::from_millis(500);
-        let mut elapsed = Duration::ZERO;
-        while elapsed < duration {
-            if self.stopped.load(Ordering::Relaxed) {
                 return;
             }
-            tokio::time::sleep(step).await;
-            elapsed += step;
+        };
+        let handle = Arc::new(handle);
+
+        // SSH disconnection watcher
+        let disconnect_notify = Arc::new(Notify::new());
+        let watcher_handle = handle.clone();
+        let watcher_notify = disconnect_notify.clone();
+        let watcher_stopped = self.stopped.clone();
+        tokio::spawn(async move {
+            loop {
+                if watcher_stopped.load(Ordering::Relaxed) {
+                    return;
+                }
+                if watcher_handle.is_closed() {
+                    watcher_notify.notify_one();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+
+        // Spawn one listener task per forward rule
+        for fwd in &self.config.forwards {
+            let task_handle = handle.clone();
+            let task_stopped = self.stopped.clone();
+            let task_rx = self.rx_bytes.clone();
+            let task_tx = self.tx_bytes.clone();
+            let target_host = fwd.target_host.clone();
+            let target_port = fwd.target_port;
+            let local_port = fwd.local_port;
+            let name = self.config.name.clone();
+
+            tokio::spawn(async move {
+                run_forward_listener(
+                    task_handle,
+                    task_stopped,
+                    task_rx,
+                    task_tx,
+                    &name,
+                    local_port,
+                    &target_host,
+                    target_port,
+                )
+                .await;
+            });
+        }
+
+        // ── Metrics emitter task (aggregated across all forwards) ────
+        // 直接 emit,不走 publish —— 否则每秒都会重建一次托盘菜单。
+        let metric_stopped = self.stopped.clone();
+        let metric_cfg = self.config.clone();
+        let metric_ah = self.app_handle.clone();
+        let metric_rx = self.rx_bytes.clone();
+        let metric_tx = self.tx_bytes.clone();
+        let metric_last_rx = self.last_rx.clone();
+        let metric_last_tx = self.last_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                if metric_stopped.load(Ordering::Relaxed) {
+                    return;
+                }
+                tokio::time::sleep(METRIC_EMIT_INTERVAL).await;
+                if metric_stopped.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                let current_rx = metric_rx.load(Ordering::Relaxed);
+                let current_tx = metric_tx.load(Ordering::Relaxed);
+                let prev_rx = metric_last_rx.swap(current_rx, Ordering::Relaxed);
+                let prev_tx = metric_last_tx.swap(current_tx, Ordering::Relaxed);
+
+                let metric = TunnelMetric {
+                    id: metric_cfg.id.clone(),
+                    name: metric_cfg.name.clone(),
+                    status: TunnelStatus::Connected,
+                    rx_bytes_per_sec: (current_rx.saturating_sub(prev_rx)) as f64,
+                    tx_bytes_per_sec: (current_tx.saturating_sub(prev_tx)) as f64,
+                };
+                let _ = metric_ah.emit("tunnel-metric", &metric);
+            }
+        });
+
+        log::info!(
+            "Tunnel '{}' started with {} forward(s) via {}",
+            self.config.name,
+            self.config.forwards.len(),
+            ssh_addr
+        );
+        self.publish_status(TunnelStatus::Connected).await;
+
+        // Wait for stop or disconnect
+        tokio::select! {
+            _ = self.wait_until_stopped() => {
+                log::info!("Tunnel '{}' stopped by user", self.config.name);
+            }
+            _ = disconnect_notify.notified() => {
+                log::warn!("Tunnel '{}' SSH connection lost", self.config.name);
+            }
+        }
+
+        // Cleanup — 终态必须先发布(前端/托盘据此复位),之后 runner 任务才会
+        // 调 remove_runtime 摘除注册。
+        if self.stopped.load(Ordering::Relaxed) {
+            self.publish_status(TunnelStatus::Disconnected).await;
+        } else {
+            self.publish_status(TunnelStatus::Error("SSH 连接已断开".to_string()))
+                .await;
         }
     }
 
@@ -337,50 +302,36 @@ impl TunnelRuntime {
     }
 }
 
-// ─── 端口绑定辅助函数 ──────────────────────────────────────────────────
-
-/// 绑定本地端口，带重试逻辑。
-/// 不使用 SO_REUSEADDR，因为 Windows 下该选项会导致多个 socket
-/// 同时绑定到同一端口，连接会随机分配到旧的（已失效）监听器。
-async fn bind_local_port(port: u16) -> std::io::Result<TcpListener> {
-    let addr = format!("127.0.0.1:{}", port);
-    for attempt in 0..5 {
-        match TcpListener::bind(&addr).await {
-            Ok(l) => return Ok(l),
-            Err(e) => {
-                if attempt < 4 {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    continue;
-                }
-                return Err(e);
-            }
-        }
-    }
-    // unreachable, but compiler needs a return
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "unreachable",
-    ))
-}
-
 // ─── Per-forward listener ──────────────────────────────────────────────
 
 async fn run_forward_listener(
     handle: Arc<client::Handle<SshClientHandler>>,
     stopped: Arc<AtomicBool>,
-    cancel: Arc<AtomicBool>,
     rx_bytes: Arc<AtomicU64>,
     tx_bytes: Arc<AtomicU64>,
     tunnel_name: &str,
     local_port: u16,
-    listener: TcpListener,
     target_host: &str,
     target_port: u16,
 ) {
+    let local_addr = format!("127.0.0.1:{}", local_port);
+    let listener = match TcpListener::bind(&local_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!(
+                "Forward {}:{} bind failed: {:#}",
+                tunnel_name,
+                local_port,
+                e
+            );
+            return;
+        }
+    };
+
     log::info!(
-        "Forward {} listening on 127.0.0.1:{} -> {}:{}",
+        "Forward {} listening on {} -> {}:{}",
         tunnel_name,
-        local_port,
+        local_addr,
         target_host,
         target_port
     );
@@ -405,21 +356,17 @@ async fn run_forward_listener(
                     }
                 }
             }
-            _ = wait_flag(stopped.clone()) => {
-                log::info!("Forward on port {} stopped by user", local_port);
-                break;
-            }
-            _ = wait_flag(cancel.clone()) => {
-                log::info!("Forward on port {} cancelled by session reset", local_port);
+            _ = wait_until(stopped.clone()) => {
+                log::info!("Forward on port {} stopping", local_port);
                 break;
             }
         }
     }
 }
 
-async fn wait_flag(flag: Arc<AtomicBool>) {
+async fn wait_until(stopped: Arc<AtomicBool>) {
     loop {
-        if flag.load(Ordering::Relaxed) {
+        if stopped.load(Ordering::Relaxed) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -484,12 +431,20 @@ async fn forward_connection(
 
 // ─── Tunnel Manager ───────────────────────────────────────────────────
 
-struct TunnelState {
-    pub stopped: Arc<AtomicBool>,
+/// 一个运行中(或正在拆除)runtime 的注册条目,key 为隧道 id。
+struct RunningTunnel {
+    stopped: Arc<AtomicBool>,
+    /// 最近一次状态转换;stopped=true 表示拆除中,不再视为"运行中"。
+    status: TunnelStatus,
+    /// 启动时的名称快照(托盘/快照用),随配置改名由 refresh_names 同步。
+    name: String,
 }
 
+/// 多隧道注册表:每个 id 至多一个 runtime。
+/// 锁纪律:任何路径先取 config 锁、后取 running 锁,锁内只克隆数据、
+/// 绝不跨锁 await GUI(托盘刷新);config 锁释放后才可调 prune/stop。
 pub struct TunnelManager {
-    state: Arc<Mutex<Option<TunnelState>>>,
+    running: Arc<RunningMap>,
     config: Arc<Mutex<AppConfig>>,
     app_handle: AppHandle,
 }
@@ -497,61 +452,157 @@ pub struct TunnelManager {
 impl TunnelManager {
     pub fn new(app_handle: AppHandle, config: Arc<Mutex<AppConfig>>) -> Self {
         Self {
-            state: Arc::new(Mutex::new(None)),
+            running: Arc::new(Mutex::new(HashMap::new())),
             config,
             app_handle,
         }
     }
 
-    /// Start the tunnel — reads config from saved state.
-    pub async fn start_tunnel(&self) {
-        self.stop_inner().await;
-        let cfg = match self.config.lock().await.tunnel.clone() {
-            Some(c) => c,
-            None => {
-                log::warn!("No saved config to start");
-                return;
+    /// 启动指定隧道(id 必须已保存在配置中,且至少一条转发规则)。
+    /// 已在运行 → Err;上一个 runtime 仍在拆除 → 等它退干净(~3s 上限)
+    /// 再注册,防止两个 runtime 抢占同一批本地端口。
+    pub async fn start_tunnel(&self, id: &str) -> Result<(), String> {
+        let cfg = {
+            let guard = self.config.lock().await;
+            guard.tunnels.iter().find(|t| t.id == id).cloned()
+        }
+        .ok_or_else(|| format!("未找到隧道: {}", id))?;
+        if cfg.forwards.is_empty() {
+            return Err(format!("隧道 '{}' 没有转发规则", cfg.name));
+        }
+
+        let mut wait_ticks = 0u32;
+        let stopped = loop {
+            {
+                let mut running = self.running.lock().await;
+                match running.get(id) {
+                    None => {
+                        let stopped = Arc::new(AtomicBool::new(false));
+                        running.insert(
+                            id.to_string(),
+                            RunningTunnel {
+                                stopped: stopped.clone(),
+                                status: TunnelStatus::Connecting,
+                                name: cfg.name.clone(),
+                            },
+                        );
+                        break stopped;
+                    }
+                    Some(e) if !e.stopped.load(Ordering::Relaxed) => {
+                        return Err(format!("隧道 '{}' 已在运行", cfg.name));
+                    }
+                    // Some + stopped=true:上一个 runtime 正在拆除,继续等待
+                    Some(_) => {}
+                }
             }
+            if wait_ticks >= 60 {
+                return Err(format!("隧道 '{}' 仍在停止中,请稍后重试", cfg.name));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            wait_ticks += 1;
         };
 
-        let runtime = Arc::new(TunnelRuntime::new(cfg, self.app_handle.clone()));
-        let stopped = runtime.stopped.clone();
-        let mgr_state = self.state.clone();
-
+        let runtime = Arc::new(TunnelRuntime::new(
+            cfg,
+            self.app_handle.clone(),
+            self.running.clone(),
+        ));
+        let running = self.running.clone();
+        let app_handle = self.app_handle.clone();
+        let id = id.to_string();
+        let cleanup_stopped = stopped.clone();
         tokio::spawn(async move {
             runtime.run().await;
-            // 无论正常结束还是异常断线，都清除状态
-            let mut s = mgr_state.lock().await;
-            *s = None;
+            // 终态已由 run() 发布,这里只负责摘除注册
+            unregister_runtime(&running, &app_handle, &id, &cleanup_stopped).await;
         });
-
-        let mut state = self.state.lock().await;
-        *state = Some(TunnelState { stopped });
+        Ok(())
     }
 
-    /// Stop the tunnel.
-    pub async fn stop_tunnel(&self) {
-        self.stop_inner().await;
-        // 立即通知前端，不等待 runtime cleanup 的异步事件
-        let metric = TunnelMetric {
-            name: String::new(),
-            status: TunnelStatus::Disconnected,
-            latency_ms: 0.0,
-            rx_bytes_per_sec: 0.0,
-            tx_bytes_per_sec: 0.0,
+    /// 请求停止:只置位标志;终态(Disconnected)由 runtime 清理路径
+    /// 统一发布,保证状态权威唯一。
+    pub async fn stop_tunnel(&self, id: &str) {
+        let running = self.running.lock().await;
+        if let Some(e) = running.get(id) {
+            e.stopped.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// 启动所有未在运行的隧道;单台失败只记日志,不阻塞其余。
+    pub async fn start_all(&self) {
+        let ids: Vec<String> = {
+            let cfg = self.config.lock().await;
+            cfg.tunnels.iter().map(|t| t.id.clone()).collect()
         };
-        let _ = self.app_handle.emit("tunnel-metric", &metric);
+        for id in ids {
+            if let Err(e) = self.start_tunnel(&id).await {
+                log::warn!("全部连接:隧道启动失败: {}", e);
+            }
+        }
     }
 
-    pub async fn is_running(&self) -> bool {
-        self.state.lock().await.is_some()
+    /// 停止所有运行中隧道。
+    pub async fn stop_all(&self) {
+        let running = self.running.lock().await;
+        for e in running.values() {
+            e.stopped.store(true, Ordering::Relaxed);
+        }
     }
 
-    async fn stop_inner(&self) {
-        let mut state = self.state.lock().await;
-        if let Some(t) = state.take() {
-            t.stopped.store(true, Ordering::Relaxed);
-            log::info!("Tunnel stop signal sent");
+    pub async fn is_running(&self, id: &str) -> bool {
+        let running = self.running.lock().await;
+        matches!(running.get(id), Some(e) if !e.stopped.load(Ordering::Relaxed))
+    }
+
+    /// 运行中隧道的状态表快照(托盘汇总图标用)。
+    pub async fn active_statuses(&self) -> HashMap<String, TunnelStatus> {
+        let running = self.running.lock().await;
+        running
+            .iter()
+            .filter(|(_, e)| !e.stopped.load(Ordering::Relaxed))
+            .map(|(id, e)| (id.clone(), e.status.clone()))
+            .collect()
+    }
+
+    /// 供 `get_tunnel_statuses` 命令:新开窗口用它做状态初始化
+    /// (事件是瞬时的,只靠 listen 会漏掉转换瞬间)。
+    pub async fn status_metrics(&self) -> Vec<TunnelMetric> {
+        let running = self.running.lock().await;
+        running
+            .iter()
+            .filter(|(_, e)| !e.stopped.load(Ordering::Relaxed))
+            .map(|(id, e)| TunnelMetric {
+                id: id.clone(),
+                name: e.name.clone(),
+                status: e.status.clone(),
+                rx_bytes_per_sec: 0.0,
+                tx_bytes_per_sec: 0.0,
+            })
+            .collect()
+    }
+
+    /// 保存配置后调用:停止已不在新列表中的运行中隧道(删除安全)。
+    pub async fn prune(&self, keep_ids: &[String]) {
+        let ids: Vec<String> = {
+            let running = self.running.lock().await;
+            running
+                .keys()
+                .filter(|id| !keep_ids.contains(id))
+                .cloned()
+                .collect()
+        };
+        for id in ids {
+            self.stop_tunnel(&id).await;
+        }
+    }
+
+    /// 运行中隧道的名称快照随配置改名同步(托盘标签用)。
+    pub async fn refresh_names(&self, tunnels: &[TunnelConfig]) {
+        let mut running = self.running.lock().await;
+        for (id, e) in running.iter_mut() {
+            if let Some(t) = tunnels.iter().find(|t| &t.id == id) {
+                e.name = t.name.clone();
+            }
         }
     }
 }

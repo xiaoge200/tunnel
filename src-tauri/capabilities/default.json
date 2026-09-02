@@ -11,6 +11,7 @@
     "core:window:allow-close",
     "core:window:allow-start-dragging",
     "core:window:allow-set-focus",
+    "core:window:allow-set-size",
     "core:window:allow-is-visible",
     "core:event:default",
     "core:event:allow-emit",

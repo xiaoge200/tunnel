@@ -1,10 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getVersion } from "@tauri-apps/api/app";
-import { open } from "@tauri-apps/plugin-dialog";
+import { LogicalSize } from "@tauri-apps/api/dpi";
+import { open, confirm } from "@tauri-apps/plugin-dialog";
 
-// ─── Types ────────────────────────────────────────────────────────────
+// ─── 类型:与 src-tauri/src/config.rs 的 serde 形状一一对应 ───────────
+// 修改 Rust 侧结构时务必同步这里(snake_case 字段名、外部标签枚举)。
 
 interface ForwardRule {
   local_port: number;
@@ -13,6 +14,7 @@ interface ForwardRule {
 }
 
 interface TunnelConfig {
+  id: string;
   name: string;
   ssh_host: string;
   ssh_port: number;
@@ -23,19 +25,48 @@ interface TunnelConfig {
   forwards: ForwardRule[];
 }
 
+type StatusKind = "Connected" | "Connecting" | "Disconnected" | "Error";
+
+type RawStatus = StatusKind | { Error: string };
+
 interface TunnelMetric {
+  id: string;
   name: string;
-  status: "Disconnected" | "Connecting" | "Connected" | { Error: string };
-  latency_ms: number;
+  status: RawStatus;
   rx_bytes_per_sec: number;
   tx_bytes_per_sec: number;
 }
 
 interface AppConfig {
-  tunnel: TunnelConfig | null;
+  tunnels: TunnelConfig[];
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────
+// ─── 状态 helper ──────────────────────────────────────────────────────
+
+function statusKindOf(raw: RawStatus): StatusKind {
+  return typeof raw === "string" ? raw : "Error";
+}
+
+function statusZhOf(raw: RawStatus): string {
+  switch (statusKindOf(raw)) {
+    case "Connected":
+      return "已连接";
+    case "Connecting":
+      return "连接中";
+    case "Error":
+      return "错误";
+    case "Disconnected":
+      return "未连接";
+  }
+}
+
+function statusErrorOf(raw: RawStatus): string {
+  return typeof raw === "object" && "Error" in raw ? raw.Error : "";
+}
+
+function cssKindOf(raw: RawStatus): string {
+  return statusKindOf(raw).toLowerCase();
+}
 
 function formatBytes(bytesPerSec: number): string {
   const units = ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"];
@@ -48,106 +79,148 @@ function formatBytes(bytesPerSec: number): string {
   return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
 }
 
-// ─── Canvas Latency Graph ─────────────────────────────────────────────
+// ─── DOM helpers ──────────────────────────────────────────────────────
 
-class LatencyGraph {
-  private canvas: HTMLCanvasElement;
-  private ctx: CanvasRenderingContext2D;
-  private data: number[];
-  private maxPoints: number;
-  private maxLatency = 50;
-  private stepX: number;
-  private gradient: CanvasGradient;
-  private glowGradient: CanvasGradient;
-  private renderPending = false;
-
-  constructor(canvas: HTMLCanvasElement, maxPoints: number) {
-    const ctx = canvas.getContext("2d")!;
-    this.canvas = canvas;
-    this.ctx = ctx;
-    this.data = [];
-    this.maxPoints = maxPoints;
-    this.stepX = canvas.width / (maxPoints - 1);
-
-    this.gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
-    this.gradient.addColorStop(0, "rgba(0, 245, 160, 0.25)");
-    this.gradient.addColorStop(1, "rgba(0, 245, 160, 0.02)");
-
-    this.glowGradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
-    this.glowGradient.addColorStop(0, "rgba(0, 245, 160, 0.8)");
-    this.glowGradient.addColorStop(1, "rgba(0, 245, 160, 0.1)");
+function el(tag: string, attrs: Record<string, any> = {}): HTMLElement {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "text") e.textContent = v;
+    else if (k === "class") e.className = v;
+    else (e as any)[k] = v;
   }
+  return e;
+}
 
-  push(value: number) {
-    const arr = this.data;
-    arr.push(value);
-    if (arr.length > this.maxPoints) arr.shift();
-    this.scheduleRender();
-  }
+function lbl(text: string, child: HTMLElement): HTMLElement {
+  const l = el("label");
+  l.textContent = text;
+  l.appendChild(child);
+  return l;
+}
 
-  private scheduleRender() {
-    if (this.renderPending) return;
-    this.renderPending = true;
-    requestAnimationFrame(() => {
-      this.renderPending = false;
-      this.renderNow();
-    });
-  }
+// ─── Toast ────────────────────────────────────────────────────────────
 
-  private renderNow() {
-    const { canvas, ctx, data, maxLatency, stepX } = this;
-    const w = canvas.width;
-    const h = canvas.height;
-    ctx.clearRect(0, 0, w, h);
+function showToast(title: string, message: string) {
+  const existing = document.getElementById("tunnel-toast");
+  if (existing) existing.remove();
 
-    if (data.length < 2) return;
+  const toast = document.createElement("div");
+  toast.id = "tunnel-toast";
+  toast.innerHTML = `<strong>${title}</strong><p>${message}</p>`;
+  document.body.appendChild(toast);
 
-    const yy = (val: number) => h - (val / maxLatency) * (h - 2) - 1;
+  setTimeout(() => {
+    toast.style.opacity = "0";
+    setTimeout(() => toast.remove(), 300);
+  }, 3000);
 
-    ctx.beginPath();
-    const points: { x: number; y: number }[] = [];
-    for (let i = 0; i < data.length; i++) {
-      const x = w - (data.length - 1 - i) * stepX;
-      const val = Math.min(data[i], maxLatency);
-      const y = yy(val);
-      points.push({ x, y });
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
+  toast.addEventListener("click", () => toast.remove());
+}
 
-    ctx.strokeStyle = this.glowGradient;
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
+// ─── 拖拽实现 ──────────────────────────────────────────────────────────
 
-    if (points.length > 0) {
-      const last = points[points.length - 1];
-      ctx.beginPath();
-      ctx.arc(last.x, last.y, 3, 0, Math.PI * 2);
-      ctx.fillStyle = "#00f5a0";
-      ctx.fill();
-    }
+// 单次委托监听:空白区域 mousedown → Tauri 原生 startDragging;
+// 交互元素(button/input 等)不拖拽。行/卡片是动态挂载的,因此不逐个绑定。
+function setupDragAndButtons(root: HTMLElement) {
+  root.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    if (target.closest("button, input, select, textarea, a")) return;
+    getCurrentWindow()
+      .startDragging()
+      .catch(() => {});
+  });
+}
+
+// ─── 启停按钮渲染 helper(行与卡片共用)──────────────────────────────
+
+function renderCtlButton(
+  btn: HTMLButtonElement,
+  kind: StatusKind,
+  busy: "start" | "stop" | null,
+) {
+  btn.disabled = false;
+  btn.className = "btn-ctl";
+  if (busy === "start") {
+    btn.textContent = "⏳ 连接中…";
+    btn.disabled = true;
+  } else if (busy === "stop") {
+    btn.textContent = "⏳ 停止中…";
+    btn.disabled = true;
+  } else if (kind === "Connected") {
+    btn.textContent = "⏹ 停止";
+    btn.classList.add("btn-stop-tunnel");
+  } else if (kind === "Connecting") {
+    btn.textContent = "连接中…";
+    btn.disabled = true;
+    btn.classList.add("btn-connecting");
+  } else {
+    btn.textContent = "▶ 启动";
+    btn.classList.add("btn-start-tunnel");
   }
 }
 
-// ─── Mini Widget ──────────────────────────────────────────────────────
+/// 点击后置 busy;等待 metric 事件驱动按钮回到稳态。invoke 报错时
+/// 立即清 busy(已在运行等错误不发事件,由 toast/静默兜底)。
+async function clickCtl(
+  btn: HTMLButtonElement,
+  setBusy: (b: "start" | "stop" | null) => void,
+  kind: StatusKind,
+  getBusy: () => "start" | "stop" | null,
+  id: string,
+) {
+  if (kind === "Connected") {
+    setBusy("stop");
+    try {
+      await invoke("stop_tunnel", { id });
+    } catch (e) {
+      showToast("停止失败", String(e));
+      setBusy(null);
+    }
+  } else if (kind !== "Connecting") {
+    setBusy("start");
+    try {
+      await invoke("start_tunnel", { id });
+    } catch (e) {
+      const msg = typeof e === "string" ? e : JSON.stringify(e);
+      if (!msg.includes("已在运行")) showToast("启动失败", msg);
+      setBusy(null);
+    }
+  }
+  renderCtlButton(btn, kind, getBusy());
+}
+
+// ─── 迷你状态面板:每隧道一行 ─────────────────────────────────────────
+
+interface RowState {
+  id: string;
+  name: string;
+  raw: RawStatus;
+  /// 上一次渲染的 kind;busy 状态只在 kind 变化时解除。
+  prevKind: StatusKind;
+  busy: "start" | "stop" | null;
+  root: HTMLElement;
+  els: {
+    dot: HTMLSpanElement;
+    nameEl: HTMLSpanElement;
+    statusEl: HTMLSpanElement;
+    rates: HTMLSpanElement;
+    btn: HTMLButtonElement;
+  };
+}
+
+const WIDGET_WIDTH = 340;
+const WIDGET_MIN_H = 200;
+const WIDGET_MAX_H = 420;
 
 class MiniWidget {
-  private latencyEl: HTMLElement;
-  private rxEl: HTMLElement;
-  private txEl: HTMLElement;
-  private statusEl: HTMLElement;
-  private graph: LatencyGraph;
+  private rowsEl: HTMLElement;
+  private headerEl: HTMLElement;
+  private rows = new Map<string, RowState>();
 
   constructor() {
-    this.latencyEl = document.getElementById("metric-latency")!;
-    this.rxEl = document.getElementById("metric-rx")!;
-    this.txEl = document.getElementById("metric-tx")!;
-    this.statusEl = document.getElementById("status-badge")!;
-
-    const canvas = document.getElementById(
-      "latency-canvas",
-    ) as HTMLCanvasElement;
-    this.graph = new LatencyGraph(canvas, 30);
+    this.rowsEl = document.getElementById("tunnel-rows")!;
+    this.headerEl = document.getElementById("widget-header")!;
 
     document.getElementById("btn-config")!.addEventListener("click", () => {
       invoke("show_config_window").catch(console.error);
@@ -157,62 +230,327 @@ class MiniWidget {
     });
 
     listen<TunnelMetric>("tunnel-metric", (event) => {
-      this.update(event.payload);
+      this.onMetric(event.payload);
     }).catch(console.error);
+    // 配置面板保存后重建列表(新增/改名/删除)
+    listen("config-updated", () => {
+      this.load().catch(console.error);
+    }).catch(console.error);
+
+    this.load().catch(console.error);
   }
 
-  private update(metric: TunnelMetric) {
-    const lat = Math.round(metric.latency_ms);
-    this.latencyEl.textContent = `${lat} ms`;
-    this.graph.push(metric.latency_ms);
+  private async load() {
+    const appCfg: AppConfig = await invoke("get_config");
+    // 快照补齐事件缺口:窗口刚打开时可能错过 Connecting 等瞬态
+    const snaps: TunnelMetric[] = await invoke("get_tunnel_statuses");
+    const snapMap = new Map(snaps.map((m) => [m.id, m]));
 
-    this.rxEl.textContent = formatBytes(metric.rx_bytes_per_sec);
-    this.txEl.textContent = formatBytes(metric.tx_bytes_per_sec);
+    this.rowsEl.innerHTML = "";
+    this.rows.clear();
 
-    const statusStr =
-      typeof metric.status === "string" ? metric.status : "Error";
-    const statusMap: Record<string, string> = {
-      Connected: "已连接",
-      Connecting: "连接中…",
-      Disconnected: "未连接",
-      Error: "错误",
+    if (appCfg.tunnels.length === 0) {
+      const hint = el("div", { class: "widget-empty", text: "暂无隧道,点击 ⚙ 添加" });
+      this.rowsEl.appendChild(hint);
+    }
+    for (const t of appCfg.tunnels) {
+      const st = this.makeRow(t.id, t.name);
+      // 无快照的行也要走 applyRaw:按钮/点/状态词初态统一在此渲染
+      this.applyRaw(st, snapMap.get(t.id)?.status ?? "Disconnected");
+      this.rows.set(t.id, st);
+      this.rowsEl.appendChild(st.root);
+    }
+    this.applyWindowSize();
+  }
+
+  private makeRow(id: string, name: string): RowState {
+    const dot = el("span", { class: "row-dot disconnected" }) as HTMLSpanElement;
+    const nameEl = el("span", { class: "row-name", text: name }) as HTMLSpanElement;
+    // 状态文字与速率共用第二行:状态词着色,速率弱化
+    const statusEl = el("span", {
+      class: "row-status disconnected",
+      text: "未连接",
+    }) as HTMLSpanElement;
+    const rates = el("span", {
+      class: "row-rates",
+      text: "▼ 0 B/s  ▲ 0 B/s",
+    }) as HTMLSpanElement;
+    const btn = el("button", { class: "btn-ctl" }) as HTMLButtonElement;
+
+    const st: RowState = {
+      id,
+      name,
+      raw: "Disconnected",
+      prevKind: "Disconnected",
+      busy: null,
+      root: el("div", { class: "tunnel-row" }) as HTMLElement,
+      els: { dot, nameEl, statusEl, rates, btn },
     };
-    this.statusEl.textContent = `\u25CF ${statusMap[statusStr] || statusStr}`;
-    this.statusEl.className = "tunnel-status-badge";
-    if (statusStr === "Connected") this.statusEl.classList.add("connected");
-    else if (statusStr === "Connecting")
-      this.statusEl.classList.add("connecting");
-    else if (statusStr === "Error") this.statusEl.classList.add("error");
-    else this.statusEl.classList.add("disconnected");
+
+    const main = el("div", { class: "row-main" });
+    const meta = el("div", { class: "row-meta" });
+    meta.appendChild(statusEl);
+    meta.appendChild(rates);
+    main.appendChild(nameEl);
+    main.appendChild(meta);
+    st.root.appendChild(dot);
+    st.root.appendChild(main);
+    st.root.appendChild(btn);
+
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      clickCtl(btn, (b) => (st.busy = b), statusKindOf(st.raw), () => st.busy, id);
+    });
+    return st;
+  }
+
+  /// 刷新一行视觉:按钮/状态词/点无条件渲染(1Hz tick 的 DOM 开销可忽略);
+  /// busy 只在 kind 真正变化时解除,避免被同 kind 的重复事件提前打断。
+  private applyRaw(st: RowState, raw: RawStatus) {
+    const kind = statusKindOf(raw);
+    const kindChanged = kind !== st.prevKind;
+    st.prevKind = kind;
+    st.raw = raw;
+    if (st.busy && kindChanged) st.busy = null; // 转换完成,按钮回稳态
+    renderCtlButton(st.els.btn, kind, st.busy);
+    st.els.dot.className = `row-dot ${cssKindOf(raw)}`;
+    st.els.statusEl.textContent = statusZhOf(raw);
+    st.els.statusEl.className = `row-status ${cssKindOf(raw)}`;
+    // 错误详情放悬浮提示;状态面板不弹 toast
+    const err = kind === "Error" ? statusErrorOf(raw) : "";
+    st.els.statusEl.title = err;
+    st.els.dot.title = err;
+  }
+
+  private onMetric(m: TunnelMetric) {
+    const st = this.rows.get(m.id);
+    if (!st) return; // 未知(已删除)id 的事件直接丢弃
+    st.els.rates.textContent = `▼ ${formatBytes(m.rx_bytes_per_sec)}   ▲ ${formatBytes(m.tx_bytes_per_sec)}`;
+    this.applyRaw(st, m.status);
+  }
+
+  /// 窗口高度随行数自适应:头部高 + 行区内容高 + 留白,钳制在 [200, 420]。
+  private applyWindowSize() {
+    const rowsH = this.rowsEl.scrollHeight || 40;
+    const headerH = this.headerEl.offsetHeight || 32;
+    const h = Math.min(WIDGET_MAX_H, Math.max(WIDGET_MIN_H, headerH + rowsH + 16));
+    getCurrentWindow()
+      .setSize(new LogicalSize(WIDGET_WIDTH, h))
+      .catch(() => {});
   }
 }
 
-// ─── Config Panel ─────────────────────────────────────────────────────
+// ─── 配置面板:主从式(列表 ↔ 编辑) ─────────────────────────────────
+
+/// 卡片上随 metric 事件更新的元素。
+interface CardEls {
+  dot: HTMLSpanElement;
+  chip: HTMLSpanElement;
+  btn: HTMLButtonElement;
+  err: HTMLDivElement;
+}
 
 class ConfigPanel {
   private area: HTMLElement;
-  private savedConfig: TunnelConfig | null = null;
-  private btnState: "stopped" | "starting" | "started" | "stopping" = "stopped";
+  private titleEl: HTMLElement;
+  private mode: "list" | "edit" = "list";
+  private tunnels: TunnelConfig[] = [];
+  /// 卡片状态表:快照 + tunnel-metric 事件;编辑模式下只更新表,不碰 DOM。
+  private statuses = new Map<string, RawStatus>();
+  private cardEls = new Map<string, CardEls>();
+  private editId: string | null = null; // null = 新建
+  private allBusy = false;
 
   constructor() {
     this.area = document.getElementById("tunnel-editor-area")!;
-    this.loadAndBuild();
-    this.listenStatus();
+    this.titleEl = document.getElementById("config-title")!;
+
+    listen<TunnelMetric>("tunnel-metric", (event) => {
+      const m = event.payload;
+      this.statuses.set(m.id, m.status);
+      // 卡片视觉随事件驱动(列表已渲染时);未知(已删除)id 直接丢弃
+      const els = this.cardEls.get(m.id);
+      if (this.mode === "list" && els) this.applyCardVisuals(els, m.status);
+    }).catch(console.error);
+
+    this.load().catch(console.error);
   }
 
-  private async loadAndBuild() {
-    try {
-      const appCfg: AppConfig = await invoke("get_config");
-      this.savedConfig = appCfg.tunnel;
-    } catch (e) {
-      console.error("加载配置失败:", e);
+  private async load() {
+    const [appCfg, snaps] = await Promise.all([
+      invoke<AppConfig>("get_config"),
+      invoke<TunnelMetric[]>("get_tunnel_statuses"),
+    ]);
+    this.tunnels = appCfg.tunnels;
+    this.statuses = new Map(snaps.map((m) => [m.id, m.status]));
+    this.renderList();
+  }
+
+  // ── 列表视图 ──────────────────────────────────────────────────────
+
+  private renderList() {
+    this.mode = "list";
+    this.titleEl.textContent = "Tunnel - 配置";
+    this.area.innerHTML = "";
+    this.cardEls.clear();
+
+    // 工具栏:添加 / 全部连接 / 全部停止
+    const toolbar = el("div", { class: "config-actions toolbar" });
+    const addBtn = el("button", { class: "btn-primary", text: "+ 添加隧道" }) as HTMLButtonElement;
+    addBtn.addEventListener("click", () => this.openEditor(null));
+    const allStart = el("button", { class: "btn-secondary", text: "▶ 全部连接" }) as HTMLButtonElement;
+    allStart.addEventListener("click", () => this.toggleAll("start"));
+    const allStop = el("button", { class: "btn-secondary", text: "⏹ 全部停止" }) as HTMLButtonElement;
+    allStop.addEventListener("click", () => this.toggleAll("stop"));
+    toolbar.appendChild(addBtn);
+    toolbar.appendChild(allStart);
+    toolbar.appendChild(allStop);
+    this.area.appendChild(toolbar);
+
+    if (this.tunnels.length === 0) {
+      const empty = el("div", {
+        id: "no-tunnels-msg",
+        text: "暂无隧道,点击上方 [+ 添加隧道] 创建第一个连接",
+      });
+      this.area.appendChild(empty);
+      return;
     }
-    this.renderEditor(this.savedConfig || this.defaultConfig());
+
+    const list = el("div", { class: "tunnel-list" });
+    for (const t of this.tunnels) {
+      list.appendChild(this.makeCard(t));
+    }
+    this.area.appendChild(list);
+  }
+
+  private makeCard(t: TunnelConfig): HTMLElement {
+    const raw = this.statuses.get(t.id) ?? "Disconnected";
+
+    const card = el("div", { class: "tunnel-card" }) as HTMLElement;
+
+    const dot = el("span", { class: "row-dot" }) as HTMLSpanElement;
+    const nameEl = el("div", { class: "card-name", text: t.name }) as HTMLDivElement;
+    const subEl = el("div", {
+      class: "card-sub",
+      text: `${t.ssh_user}@${t.ssh_host}:${t.ssh_port} · ${t.forwards.length} 条转发`,
+    }) as HTMLDivElement;
+    const chip = el("span", { class: "tunnel-status-badge" }) as HTMLSpanElement;
+    // 错误原因内联展示(截断),悬停可看全文
+    const errEl = el("div", { class: "card-error" }) as HTMLDivElement;
+
+    const head = el("div", { class: "card-head" });
+    const titleBox = el("div", { class: "card-title" });
+    titleBox.appendChild(nameEl);
+    titleBox.appendChild(subEl);
+    titleBox.appendChild(errEl);
+    head.appendChild(dot);
+    head.appendChild(titleBox);
+    head.appendChild(chip);
+    card.appendChild(head);
+
+    const actions = el("div", { class: "card-actions" });
+    const ctl = el("button", { class: "btn-ctl" }) as HTMLButtonElement;
+    const els: CardEls = { dot, chip, btn: ctl, err: errEl };
+    this.applyCardVisuals(els, raw); // 初始状态一次到位(含错误消息 title)
+    this.cardEls.set(t.id, els);
+
+    const editBtn = el("button", { class: "btn-secondary", text: "编辑" }) as HTMLButtonElement;
+    editBtn.addEventListener("click", () => this.openEditor(t.id));
+    const delBtn = el("button", { class: "btn-delete-tunnel", text: "删除" }) as HTMLButtonElement;
+    delBtn.addEventListener("click", () => this.deleteTunnel(t));
+
+    ctl.addEventListener("click", () => {
+      const kind = statusKindOf(this.statuses.get(t.id) ?? "Disconnected");
+      // 按钮视觉由 metric 事件驱动,这里只负责发起调用
+      clickCtl(ctl, () => {}, kind, () => null, t.id);
+    });
+    actions.appendChild(ctl);
+    actions.appendChild(editBtn);
+    actions.appendChild(delBtn);
+    card.appendChild(actions);
+    return card;
+  }
+
+  /// 卡片视觉的唯一入口:点色 / 徽章文案与颜色 / 错误内联与悬浮详情 /
+  /// 启停按钮。
+  private applyCardVisuals(els: CardEls, raw: RawStatus) {
+    const kind = statusKindOf(raw);
+    els.dot.className = `row-dot ${cssKindOf(raw)}`;
+    els.chip.textContent = statusZhOf(raw);
+    els.chip.className = `tunnel-status-badge ${cssKindOf(raw)}`;
+    const err = kind === "Error" ? statusErrorOf(raw) : "";
+    els.chip.title = err;
+    els.err.textContent = err;
+    els.err.title = err;
+    els.err.style.display = err ? "" : "none";
+    renderCtlButton(els.btn, kind, null);
+  }
+
+  private toggleAll(target: "start" | "stop") {
+    if (this.allBusy) return;
+    this.allBusy = true;
+    const jobs: Promise<unknown>[] = [];
+    for (const t of this.tunnels) {
+      const kind = statusKindOf(this.statuses.get(t.id) ?? "Disconnected");
+      if (target === "start" && (kind === "Connected" || kind === "Connecting")) continue;
+      if (target === "stop" && kind !== "Connected" && kind !== "Connecting") continue;
+      jobs.push(
+        invoke(target === "start" ? "start_tunnel" : "stop_tunnel", { id: t.id }).catch((e) => {
+          showToast(target === "start" ? "启动失败" : "停止失败", String(e));
+        }),
+      );
+    }
+    Promise.allSettled(jobs).finally(() => {
+      this.allBusy = false;
+    });
+  }
+
+  private async deleteTunnel(t: TunnelConfig) {
+    const ok = await confirm(`确定删除隧道 “${t.name}” 吗?`, {
+      title: "删除隧道",
+      kind: "warning",
+    }).catch(() => false);
+    if (!ok) return;
+    // 后端 prune 会自动停止运行中的隧道;本窗随后收到 Disconnected 事件
+    // 时该 id 已不在卡片集合里 → 直接丢弃。
+    this.tunnels = this.tunnels.filter((x) => x.id !== t.id);
+    try {
+      await this.saveAndAdopt();
+      this.renderList(); // 删除成功:重画列表移除该卡
+    } catch (e) {
+      this.tunnels.push(t); // 保存失败回滚
+      this.renderList();
+      showToast("删除失败", String(e));
+    }
+  }
+
+  /// 保存当前列表,采纳后端返回(新条目会拿到分配好的 id)。
+  private async saveAndAdopt() {
+    const saved: AppConfig = await invoke("save_config", { tunnels: this.tunnels });
+    this.tunnels = saved.tunnels;
+  }
+
+  // ── 编辑视图(新建/编辑共用) ─────────────────────────────────────
+
+  /// 深拷贝(配置是纯 JSON,编辑器内直接改副本,取消不改原数据)。
+  private cloneTunnel(t: TunnelConfig): TunnelConfig {
+    return JSON.parse(JSON.stringify(t)) as TunnelConfig;
+  }
+
+  private async openEditor(id: string | null) {
+    this.mode = "edit";
+    this.editId = id;
+    const cfg: TunnelConfig = id
+      ? this.cloneTunnel(this.tunnels.find((t) => t.id === id)!)
+      : this.defaultConfig();
+    this.titleEl.textContent = id ? "编辑隧道" : "新建隧道";
+    this.renderEditor(cfg);
   }
 
   private defaultConfig(): TunnelConfig {
     return {
-      name: "SSH 隧道",
+      id: "",
+      name: "新隧道",
       ssh_host: "",
       ssh_port: 22,
       ssh_user: "root",
@@ -326,10 +664,7 @@ class ConfigPanel {
     const fwdSection = el("div", { class: "forward-rules" });
     const fwdLabel = el("div", { class: "forward-header" });
     fwdLabel.innerHTML = "<span>端口转发规则</span>";
-    const addFwdBtn = el("button", {
-      class: "btn-add-forward",
-      text: "+ 添加",
-    });
+    const addFwdBtn = el("button", { class: "btn-add-forward", text: "+ 添加" });
     fwdLabel.appendChild(addFwdBtn);
     fwdSection.appendChild(fwdLabel);
 
@@ -396,13 +731,10 @@ class ConfigPanel {
 
     // ── Action buttons ───────────────────────────────────────────────
     const actions = el("div", { class: "editor-actions" });
-    const startBtn = el("button", {
-      class: "btn-start-tunnel",
-      text: "▶ 启动",
-    }) as HTMLButtonElement;
 
     // build config from inputs
     const buildConfig = (): TunnelConfig => ({
+      id: cfg.id,
       name:
         (sshSection.querySelector(".field-name") as HTMLInputElement).value ||
         "未命名",
@@ -442,205 +774,62 @@ class ConfigPanel {
       return e;
     };
 
-    startBtn.addEventListener("click", async () => {
-      if (this.btnState === "starting" || this.btnState === "stopping") return;
-
-      if (this.btnState === "stopped") {
-        const c = buildConfig();
-        const errs = validate(c);
-        if (errs.length > 0) {
-          showToast("请修正", errs.join("\n"));
-          return;
+    const saveBtn = el("button", { class: "btn-primary", text: "💾 保存" }) as HTMLButtonElement;
+    saveBtn.addEventListener("click", async () => {
+      const c = buildConfig();
+      const errs = validate(c);
+      if (errs.length > 0) {
+        showToast("请修正", errs.join("\n"));
+        return;
+      }
+      let prevIdx = -1;
+      let prevEntry: TunnelConfig | null = null;
+      if (this.editId) {
+        prevIdx = this.tunnels.findIndex((t) => t.id === this.editId);
+        if (prevIdx >= 0) {
+          prevEntry = this.cloneTunnel(this.tunnels[prevIdx]);
+          this.tunnels[prevIdx] = c;
         }
-
-        this.btnState = "starting";
-        startBtn.textContent = "⏳ 连接中…";
-        startBtn.disabled = true;
-        this.setEditingEnabled(false);
-
-        try {
-          await invoke("save_config", { config: c });
-          await invoke("start_tunnel");
-        } catch (e: any) {
-          this.setStopped(startBtn);
-          showToast("启动失败", typeof e === "string" ? e : JSON.stringify(e));
-        }
-      } else if (this.btnState === "started") {
-        this.btnState = "stopping";
-        startBtn.textContent = "⏳ 停止中…";
-        startBtn.disabled = true;
-        try {
-          await invoke("stop_tunnel");
-        } catch (e: any) {
-          console.error("停止失败:", e);
-        }
-        this.setStopped(startBtn);
+      } else {
+        prevIdx = this.tunnels.length;
+        this.tunnels.push(c); // id 为空,由 Rust 分配后经返回采纳
+      }
+      try {
+        await this.saveAndAdopt();
+        this.renderList();
+      } catch (e) {
+        // 保存失败:回滚本地修改,重新进编辑器避免丢数据
+        this.tunnels.splice(prevIdx, 1);
+        if (prevEntry) this.tunnels.splice(prevIdx, 0, prevEntry);
+        showToast("保存失败", typeof e === "string" ? e : JSON.stringify(e));
+        this.openEditor(this.editId);
       }
     });
 
-    actions.appendChild(startBtn);
+    const backBtn = el("button", { class: "btn-secondary", text: "← 返回列表" }) as HTMLButtonElement;
+    backBtn.addEventListener("click", () => this.renderList());
+
+    actions.appendChild(backBtn);
+    actions.appendChild(saveBtn);
     sshSection.appendChild(fwdSection);
     sshSection.appendChild(actions);
     a.appendChild(sshSection);
-
-    // ── 版本号 ─────────────────────────────────────────────────────
-    const versionEl = el("div", { class: "config-version" });
-    getVersion()
-      .then((v) => {
-        versionEl.textContent = `v${v}`;
-      })
-      .catch(() => {
-        versionEl.textContent = "v0.1.0";
-      });
-    a.appendChild(versionEl);
   }
-
-  private setStopped(btn: HTMLButtonElement) {
-    this.btnState = "stopped";
-    btn.textContent = "▶ 启动";
-    btn.className = "btn-start-tunnel";
-    btn.disabled = false;
-    this.setEditingEnabled(true);
-  }
-
-  private setStarted(btn: HTMLButtonElement) {
-    this.btnState = "started";
-    btn.textContent = "⏹ 停止";
-    btn.className = "btn-stop-tunnel";
-    btn.disabled = false;
-    this.setEditingEnabled(false);
-  }
-
-  private setEditingEnabled(enabled: boolean) {
-    const els = this.area.querySelectorAll("input, select, button");
-    els.forEach((el) => {
-      // 不操作启动/停止按钮
-      if (
-        el.classList.contains("btn-start-tunnel") ||
-        el.classList.contains("btn-stop-tunnel")
-      )
-        return;
-      (el as HTMLInputElement).disabled = !enabled;
-    });
-  }
-
-  private listenStatus() {
-    listen<TunnelMetric>("tunnel-metric", (event) => {
-      const m = event.payload;
-      const status = typeof m.status === "string" ? m.status : "Error";
-
-      const btn = this.area.querySelector(
-        ".btn-start-tunnel, .btn-stop-tunnel",
-      ) as HTMLButtonElement;
-      if (!btn) return;
-
-      if (status === "Connected" && this.btnState !== "started") {
-        this.setStarted(btn);
-      } else if (status === "Error" && this.btnState === "starting") {
-        const errMsg =
-          typeof m.status === "object" && "Error" in m.status
-            ? (m.status as any).Error
-            : "";
-        this.setStopped(btn);
-        showToast("连接失败", errMsg || "请检查配置后重试");
-      } else if (status === "Error" && this.btnState === "started") {
-        this.setStopped(btn);
-      } else if (
-        status === "Disconnected" &&
-        (this.btnState === "starting" || this.btnState === "started")
-      ) {
-        this.setStopped(btn);
-      }
-    }).catch(console.error);
-  }
-}
-
-// ─── DOM helpers ──────────────────────────────────────────────────────
-
-function el(tag: string, attrs: Record<string, any> = {}): HTMLElement {
-  const e = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs)) {
-    if (k === "text") e.textContent = v;
-    else if (k === "class") e.className = v;
-    else (e as any)[k] = v;
-  }
-  return e;
-}
-
-function lbl(text: string, child: HTMLElement): HTMLElement {
-  const l = el("label");
-  l.textContent = text;
-  l.appendChild(child);
-  return l;
-}
-
-// ─── Toast ────────────────────────────────────────────────────────────
-
-function showToast(title: string, message: string) {
-  const existing = document.getElementById("tunnel-toast");
-  if (existing) existing.remove();
-
-  const toast = document.createElement("div");
-  toast.id = "tunnel-toast";
-  toast.innerHTML = `<strong>${title}</strong><p>${message}</p>`;
-  document.body.appendChild(toast);
-
-  setTimeout(() => {
-    toast.style.opacity = "0";
-    setTimeout(() => toast.remove(), 300);
-  }, 3000);
-
-  toast.addEventListener("click", () => toast.remove());
-}
-
-// ─── 拖拽实现 ──────────────────────────────────────────────────────────
-
-// 手动拖拽：在 widget-container 上监听 mousedown，调用 Tauri 原生 startDragging。
-// 同时阻止按钮/输入框的 mousedown 冒泡，防止点击它们时误触发拖拽。
-function setupDragAndButtons(root: HTMLElement) {
-  // 交互元素阻止冒泡
-  root.querySelectorAll("button, input, select, textarea, a").forEach((el) => {
-    el.addEventListener("mousedown", (e) => e.stopPropagation());
-  });
-
-  // 整个容器作为拖拽区
-  root.addEventListener("mousedown", (e) => {
-    // 只有左键点击且目标不是交互元素时才拖拽
-    if (e.button !== 0) return;
-    // 如果事件是从按钮等交互元素冒泡上来的，已经 stopPropagation 了
-    // 所以能到这里的一定是空白区域或文本
-    getCurrentWindow()
-      .startDragging()
-      .catch(() => {});
-  });
 }
 
 // ─── App Entry ────────────────────────────────────────────────────────
-
-// 1. 顶层防御：用最快速度（最高优先级）卡死全局右键和手势缩放
-window.addEventListener("contextmenu", (e) => e.preventDefault(), {
-  capture: true,
-});
-window.addEventListener(
-  "wheel",
-  (e) => {
-    if (e.ctrlKey) e.preventDefault();
-  },
-  { passive: false },
-);
 
 window.addEventListener("DOMContentLoaded", () => {
   const win = getCurrentWindow();
   const label = win.label;
 
-  // 显式切换视图：只显示当前窗口对应的 UI，隐藏另一个
+  // 显式切换视图:只显示当前窗口对应的 UI,隐藏另一个
   const miniView = document.getElementById("mini-widget-view")!;
   const configView = document.getElementById("config-panel-view")!;
 
   if (label === "mini_widget") {
     miniView.style.display = "";
     configView.style.display = "none";
-    // 手动拖拽：容器 mousedown → Tauri startDragging
     setupDragAndButtons(miniView);
     new MiniWidget();
   } else if (label === "config_panel") {
@@ -650,8 +839,8 @@ window.addEventListener("DOMContentLoaded", () => {
   }
 
   // 关闭事件处理
-  // config_panel: 不注册任何监听器，走默认关闭行为（窗口被销毁释放内存）
-  // mini_widget:  拦截关闭 → hide() 隐藏到后台（Rust 端也有 api.prevent_close 双重保障）
+  // config_panel: 不注册任何监听器,走默认关闭行为(窗口被销毁释放内存)
+  // mini_widget:  拦截关闭 → hide() 隐藏到后台(Rust 端也有 api.prevent_close 双重保障)
   if (label === "mini_widget") {
     win.onCloseRequested((event) => {
       event.preventDefault();

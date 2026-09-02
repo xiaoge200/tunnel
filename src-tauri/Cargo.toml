@@ -1,6 +1,6 @@
 [package]
 name = "Tunnel"
-version = "0.1.0"
+version = "0.2.0"
 description = "Tunnel - Database SSH Tunnel Tool"
 authors = ["xiaoge"]
 edition = "2021"

@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 1024 1024">
+  <!--
+    Tunnel logo — 几何门环 (gateway ring)
+    主题:SSH 端口转发。圆角深底上是一组向内收拢的青色透视环(隧道口),
+    中心是绿色的光核(数据出口),一道虚线轨道从左上越过环顶,带着
+    由弱到强的数据点飞向右上 —— 数据穿过隧道。
+    调色板贴合应用暗色科技风:#00d4ff 青 / #00f5a0 荧光绿 / #0a0c12 底。
+    生成:32/128/256/512 PNG + icon.ico(16-256 多尺寸),源文件即本 SVG。
+  -->
+  <defs>
+    <!-- 底色:垂直渐变 + 右上青色气氛 -->
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a0f1a"/>
+      <stop offset="0.55" stop-color="#0c1322"/>
+      <stop offset="1" stop-color="#0e1a2e"/>
+    </linearGradient>
+    <!-- 背景右上淡青色气氛光 -->
+    <radialGradient id="bgAura" cx="0.85" cy="0.1" r="0.9">
+      <stop offset="0" stop-color="#00d4ff" stop-opacity="0.10"/>
+      <stop offset="0.6" stop-color="#00d4ff" stop-opacity="0"/>
+    </radialGradient>
+    <!-- 环带主渐变:上亮下深,营造金属感 -->
+    <linearGradient id="ringGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8ef4ff"/>
+      <stop offset="0.45" stop-color="#00c8f0"/>
+      <stop offset="1" stop-color="#04519c"/>
+    </linearGradient>
+    <linearGradient id="ringGrad2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3adcff"/>
+      <stop offset="1" stop-color="#08529a"/>
+    </linearGradient>
+    <linearGradient id="ringGrad3" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1fc9f5"/>
+      <stop offset="1" stop-color="#0a3f7d"/>
+    </linearGradient>
+    <!-- 隧道纵深:环口内部边缘压暗 -->
+    <radialGradient id="holeVignette" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0.72" stop-color="#01070f" stop-opacity="0"/>
+      <stop offset="1" stop-color="#01070f" stop-opacity="0.85"/>
+    </radialGradient>
+    <!-- 中心光核 -->
+    <radialGradient id="coreHalo" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#00f5a0" stop-opacity="0.55"/>
+      <stop offset="0.55" stop-color="#00f5a0" stop-opacity="0.13"/>
+      <stop offset="1" stop-color="#00f5a0" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="coreSolid" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#eafff7"/>
+      <stop offset="0.42" stop-color="#5cffc0"/>
+      <stop offset="1" stop-color="#00b37a"/>
+    </radialGradient>
+    <!-- 数据包头:白核绿身 -->
+    <radialGradient id="packetGrad" cx="0.35" cy="0.3" r="0.85">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.35" stop-color="#baffe0"/>
+      <stop offset="1" stop-color="#00c881"/>
+    </radialGradient>
+  </defs>
+
+  <!-- 圆角底 -->
+  <rect x="32" y="32" width="960" height="960" rx="200" fill="url(#bgGrad)"/>
+  <rect x="32" y="32" width="960" height="960" rx="200" fill="url(#bgAura)"/>
+  <rect x="34" y="34" width="956" height="956" rx="198"
+        fill="none" stroke="#9fd8ff" stroke-opacity="0.14" stroke-width="3"/>
+
+  <!-- 隧道口:向中心收拢的三层青色环 -->
+  <ellipse cx="512" cy="512" rx="360" ry="300"
+           fill="none" stroke="url(#ringGrad)" stroke-width="46" opacity="0.95"/>
+  <ellipse cx="512" cy="512" rx="288" ry="224"
+           fill="none" stroke="url(#ringGrad2)" stroke-width="36" opacity="0.8"/>
+  <ellipse cx="512" cy="512" rx="206" ry="148"
+           fill="none" stroke="url(#ringGrad3)" stroke-width="26" opacity="0.62"/>
+  <!-- 洞内纵深压暗 -->
+  <ellipse cx="512" cy="512" rx="181" ry="125" fill="url(#holeVignette)"/>
+
+  <!-- 光核:数据出口 -->
+  <ellipse cx="512" cy="512" rx="178" ry="104" fill="url(#coreHalo)"/>
+  <ellipse cx="512" cy="512" rx="112" ry="60" fill="url(#coreSolid)"/>
+  <ellipse cx="512" cy="512" rx="48" ry="24" fill="#eafff7" opacity="0.95"/>
+
+  <!-- 虚线轨道:左 → 越过环顶 → 右(飞行方向) -->
+  <path d="M 132 560 A 380 460 0 0 1 892 560"
+        fill="none" stroke="#00f5a0" stroke-width="12" stroke-linecap="round"
+        stroke-dasharray="22 46" opacity="0.75"/>
+
+  <!-- 尾迹:由弱到强 -->
+  <circle cx="243" cy="235" r="22" fill="#0aa56f" opacity="0.45"/>
+  <circle cx="370" cy="134" r="30" fill="#12cf85" opacity="0.6"/>
+  <circle cx="479" cy="102" r="36" fill="#2ef2a9" opacity="0.82"/>
+
+  <!-- 数据包头 -->
+  <circle cx="702" cy="162" r="46" fill="url(#packetGrad)"/>
+  <circle cx="702" cy="162" r="58" fill="none" stroke="#00f5a0"
+          stroke-width="4" opacity="0.5"/>
+</svg>

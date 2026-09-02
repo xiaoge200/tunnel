@@ -10,7 +10,7 @@
     <body>
         <!-- Mini Widget View -->
         <div id="mini-widget-view" class="widget-container">
-            <div class="widget-header">
+            <div class="widget-header" id="widget-header">
                 <span class="widget-title">Tunnel</span>
                 <div class="widget-controls">
                     <button id="btn-config" class="ctrl-btn" title="配置">
@@ -21,42 +21,16 @@
                     </button>
                 </div>
             </div>
-            <div class="widget-body">
-                <div class="status-row">
-                    <div class="tunnel-status-badge" id="status-badge">
-                        ● 未连接
-                    </div>
-                </div>
-                <div class="metrics-row">
-                    <div class="metric-item">
-                        <span class="metric-label">延迟</span>
-                        <span class="metric-value" id="metric-latency"
-                            >-- ms</span
-                        >
-                    </div>
-                    <div class="metric-item">
-                        <span class="metric-label">⬇ 下行</span>
-                        <span class="metric-value" id="metric-rx">0 B/s</span>
-                    </div>
-                    <div class="metric-item">
-                        <span class="metric-label">⬆ 上行</span>
-                        <span class="metric-value" id="metric-tx">0 B/s</span>
-                    </div>
-                </div>
-                <div class="canvas-wrapper">
-                    <canvas
-                        id="latency-canvas"
-                        width="312"
-                        height="56"
-                    ></canvas>
-                </div>
+            <div class="widget-body" id="widget-body">
+                <!-- 每隧道一行,由 MiniWidget 动态生成 -->
+                <div id="tunnel-rows" class="tunnel-rows"></div>
             </div>
         </div>
 
         <!-- Config Panel View -->
         <div id="config-panel-view" class="config-panel" style="display: none">
             <div class="config-header">
-                <h2>Tunnel - 配置</h2>
+                <h2 id="config-title">Tunnel - 配置</h2>
             </div>
             <div class="config-body">
                 <div id="tunnel-editor-area"></div>

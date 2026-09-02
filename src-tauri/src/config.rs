@@ -62,8 +62,13 @@ pub struct ForwardRule {
 }
 
 /// SSH tunnel configuration with multiple port forwards.
+/// `id` is the stable identity used by events/statuses/commands;
+/// empty ids are filled by Rust (`AppConfig::ensure_ids`) — never send a
+/// tunnel with an empty id to `start_tunnel`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelConfig {
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub ssh_host: String,
     pub ssh_port: u16,
@@ -83,36 +88,17 @@ pub enum AuthMethod {
     },
 }
 
-impl Default for TunnelConfig {
-    fn default() -> Self {
-        Self {
-            name: "SSH 隧道".into(),
-            ssh_host: "127.0.0.1".into(),
-            ssh_port: 22,
-            ssh_user: "root".into(),
-            auth_method: AuthMethod::Password {
-                password: "".into(),
-            },
-            forwards: vec![ForwardRule {
-                local_port: 15432,
-                target_host: "127.0.0.1".into(),
-                target_port: 15432,
-            }],
-        }
-    }
-}
-
 /// Tunnel runtime status emitted to frontend every 1s.
 #[derive(Debug, Clone, Serialize)]
 pub struct TunnelMetric {
+    pub id: String,
     pub name: String,
     pub status: TunnelStatus,
-    pub latency_ms: f64,
     pub rx_bytes_per_sec: f64,
     pub tx_bytes_per_sec: f64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize)]
 pub enum TunnelStatus {
     Disconnected,
     Connecting,
@@ -120,22 +106,61 @@ pub enum TunnelStatus {
     Error(String),
 }
 
-/// Persisted config — single tunnel or none.
+/// Persisted config — a list of tunnels (multi-host). `tunnels` is the
+/// only serialized form; `tunnel` is the legacy single-tunnel shape kept
+/// solely so old `tunnel.json` files still deserialize, then
+/// [`AppConfig::migrate_and_ensure_ids`] folds it into `tunnels` on load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub tunnels: Vec<TunnelConfig>,
+    #[serde(default, skip_serializing)]
     pub tunnel: Option<TunnelConfig>,
+}
+
+/// 32-char hex id, random from ring (no extra dependency).
+pub fn generate_id() -> String {
+    let mut buf = [0u8; 16];
+    let rng = ring::rand::SystemRandom::new();
+    ring::rand::SecureRandom::fill(&rng, &mut buf).expect("system rng");
+    let mut out = String::with_capacity(32);
+    for b in buf {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
 }
 
 impl AppConfig {
     pub fn defaults() -> Self {
         Self {
-            tunnel: Some(TunnelConfig::default()),
+            tunnels: Vec::new(),
+            tunnel: None,
+        }
+    }
+
+    /// Fill empty ids and migrate the legacy single-tunnel shape.
+    /// Called on load and again on save (Rust is the single source of truth
+    /// for tunnel ids).
+    pub fn migrate_and_ensure_ids(&mut self) {
+        if self.tunnels.is_empty() {
+            if let Some(legacy) = self.tunnel.take() {
+                self.tunnels.push(legacy);
+            }
+        }
+        self.ensure_ids();
+    }
+
+    pub fn ensure_ids(&mut self) {
+        for t in &mut self.tunnels {
+            if t.id.is_empty() {
+                t.id = generate_id();
+            }
         }
     }
 
     /// 写入文件前加密所有密码
     pub fn encrypt_passwords(&mut self) {
-        if let Some(ref mut t) = self.tunnel {
+        for t in &mut self.tunnels {
             if let AuthMethod::Password { ref mut password } = t.auth_method {
                 if !password.is_empty() && !looks_encrypted(password) {
                     *password = sec::encrypt(password);
@@ -146,7 +171,7 @@ impl AppConfig {
 
     /// 从文件读取后解密所有密码
     pub fn decrypt_passwords(&mut self) {
-        if let Some(ref mut t) = self.tunnel {
+        for t in &mut self.tunnels {
             if let AuthMethod::Password { ref mut password } = t.auth_method {
                 if !password.is_empty() {
                     if let Some(plain) = sec::decrypt(password) {

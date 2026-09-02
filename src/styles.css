@@ -39,11 +39,11 @@ body {
 }
 
 /* ── Mini Widget View ─────────────────────────────────────────────── */
-/* data-tauri-drag-region 放在 .widget-container 上，整个区域可拖拽。   */
-/* 按钮通过 JS 的 stopPropagation 阻止 mousedown 冒泡，避免误触拖拽。 */
+/* 窗口高度由 JS 按隧道行数自适应(setSize 340×[200..420]),
+   容器高度跟随窗口(100%),超限部分由 .tunnel-rows 内滚。          */
 .widget-container {
     width: 340px;
-    height: 200px;
+    height: 100%;
     background: var(--bg-primary);
     border: 1px solid var(--border-color);
     border-radius: var(--radius-lg);
@@ -59,7 +59,7 @@ body {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 10px 14px 6px;
+    padding: 8px 12px 4px;
     flex-shrink: 0;
 }
 
@@ -83,7 +83,7 @@ body {
     color: var(--text-secondary);
     font-size: 15px;
     cursor: pointer;
-    padding: 3px 6px;
+    padding: 2px 6px;
     border-radius: var(--radius-sm);
     transition: color 0.15s ease;
     line-height: 1;
@@ -94,102 +94,181 @@ body {
     background: rgba(255, 255, 255, 0.06);
 }
 
-/* ── Status & Metrics ─────────────────────────────────────────────── */
 .widget-body {
-    padding: 6px 14px 10px;
     flex: 1;
+    min-height: 0;
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    padding: 2px 8px 8px;
 }
 
-.status-row {
+/* 每隧道一行的滚动容器 */
+.tunnel-rows {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.widget-empty {
+    color: var(--text-secondary);
+    font-size: 12px;
+    text-align: center;
+    padding: 28px 12px;
+}
+
+/* ── 单行:状态点 + 名称/速率 + 启停按钮 ─────────────────────────── */
+.tunnel-row {
+    height: 46px;
+    flex-shrink: 0;
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
+    padding: 4px 8px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: var(--radius-sm);
 }
 
-.tunnel-status-badge {
-    font-size: 13px;
+.row-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: #4a5160;
+}
+
+.row-dot.connected {
+    background: var(--accent-green);
+    box-shadow: var(--glow-green);
+}
+
+.row-dot.connecting {
+    background: var(--accent-yellow);
+    animation: pulse 1.2s ease-in-out infinite;
+}
+
+.row-dot.error {
+    background: var(--accent-red);
+}
+
+.row-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+
+.row-name {
+    font-size: 12.5px;
     font-weight: 600;
-    padding: 2px 10px;
-    border-radius: 10px;
-    background: rgba(255, 255, 255, 0.04);
-    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
-.tunnel-status-badge.connected {
+/* 第二行:状态词 + 速率 */
+.row-meta {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+}
+
+.row-status {
+    font-size: 11px;
+    font-weight: 600;
+    flex-shrink: 0;
+}
+
+.row-status.connected {
     color: var(--accent-green);
     text-shadow: var(--glow-green);
 }
 
-.tunnel-status-badge.connecting {
+.row-status.connecting {
     color: var(--accent-yellow);
     animation: pulse 1.2s ease-in-out infinite;
 }
 
-.tunnel-status-badge.error {
+.row-status.error {
     color: var(--accent-red);
 }
 
-.tunnel-status-badge.disconnected {
+.row-status.disconnected {
     color: var(--text-secondary);
+}
+
+.row-rates {
+    font-size: 11px;
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 @keyframes pulse {
     0%,
     100% {
-        opacity: 0.6;
+        opacity: 0.55;
     }
     50% {
         opacity: 1;
     }
 }
 
-.metrics-row {
-    display: flex;
-    gap: 10px;
-    justify-content: space-between;
-}
-
-.metric-item {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 0;
-}
-
-.metric-label {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    color: var(--text-secondary);
-}
-
-.metric-value {
-    font-size: 15px;
-    font-weight: 700;
-    color: var(--accent-green);
-    text-shadow: var(--glow-green);
-    font-variant-numeric: tabular-nums;
-}
-
-/* ── Canvas ───────────────────────────────────────────────────────── */
-.canvas-wrapper {
-    flex: 1;
-    display: flex;
-    align-items: flex-end;
-    justify-content: center;
+/* ── 启停按钮(行与卡片共用) ─────────────────────────────────────── */
+.btn-ctl {
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    flex-shrink: 0;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-primary);
+    padding: 5px 12px;
     border-radius: var(--radius-sm);
-    background: rgba(0, 0, 0, 0.25);
-    overflow: hidden;
-    margin-top: 2px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition:
+        background 0.15s,
+        box-shadow 0.15s;
 }
 
-#latency-canvas {
-    display: block;
-    width: 100%;
-    height: 100%;
+.btn-ctl:disabled {
+    opacity: 0.55;
+    cursor: default;
+}
+
+.btn-ctl.btn-start-tunnel {
+    border-color: var(--accent-green);
+    color: var(--accent-green);
+    background: rgba(0, 245, 160, 0.08);
+}
+
+.btn-ctl.btn-start-tunnel:not(:disabled):hover {
+    background: rgba(0, 245, 160, 0.18);
+    box-shadow: var(--glow-green);
+}
+
+.btn-ctl.btn-stop-tunnel {
+    border-color: var(--accent-yellow);
+    color: var(--accent-yellow);
+    background: rgba(255, 200, 0, 0.06);
+}
+
+.btn-ctl.btn-stop-tunnel:not(:disabled):hover {
+    background: rgba(255, 200, 0, 0.14);
+}
+
+.btn-ctl.btn-connecting {
+    border-color: rgba(245, 197, 66, 0.45);
+    color: var(--accent-yellow);
+    background: transparent;
 }
 
 /* ── Config Panel View ────────────────────────────────────────────── */
@@ -199,47 +278,210 @@ body {
     background: var(--bg-secondary);
     display: flex;
     flex-direction: column;
-    padding: 16px;
+    padding: 14px 16px;
 }
 
 .config-header h2 {
-    font-size: 17px;
+    font-size: 16px;
     font-weight: 600;
     color: var(--accent-cyan);
     letter-spacing: 1px;
-    margin-bottom: 16px;
+    margin-bottom: 12px;
 }
 
 .config-body {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
     gap: 12px;
 }
 
+/* ── 通用按钮变体 ────────────────────────────────────────────────── */
+.btn-primary {
+    background: linear-gradient(
+        135deg,
+        rgba(0, 212, 255, 0.15),
+        rgba(0, 245, 160, 0.1)
+    );
+    border: 1px solid var(--accent-cyan);
+    color: var(--accent-cyan);
+    padding: 7px 16px;
+    border-radius: var(--radius-md);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition:
+        background 0.2s,
+        box-shadow 0.2s;
+    letter-spacing: 1px;
+    white-space: nowrap;
+}
+
+.btn-primary:hover {
+    background: linear-gradient(
+        135deg,
+        rgba(0, 212, 255, 0.25),
+        rgba(0, 245, 160, 0.2)
+    );
+    box-shadow: var(--glow-cyan);
+}
+
+.btn-secondary {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: var(--text-primary);
+    padding: 7px 14px;
+    border-radius: var(--radius-sm);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.15s;
+}
+
+.btn-secondary:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.btn-delete-tunnel {
+    background: rgba(255, 71, 87, 0.06);
+    border: 1px solid rgba(255, 71, 87, 0.3);
+    color: var(--accent-red);
+    padding: 6px 12px;
+    border-radius: var(--radius-sm);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.15s;
+}
+
+.btn-delete-tunnel:hover {
+    background: rgba(255, 71, 87, 0.16);
+}
+
+/* ── 列表视图 ────────────────────────────────────────────────────── */
+.config-actions.toolbar {
+    display: flex;
+    gap: 8px;
+    justify-content: space-between;
+    padding: 0;
+}
+
+.config-actions.toolbar > button {
+    flex: 1;
+}
+
 #no-tunnels-msg {
     color: var(--text-secondary);
     font-size: 14px;
     text-align: center;
-    padding: 32px;
+    padding: 36px 20px;
 }
 
+.tunnel-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.tunnel-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.card-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.card-title {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.card-name {
+    font-size: 13.5px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.card-sub {
+    font-size: 11px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* 连接错误原因(截断一行,悬停 title 看全文) */
+.card-error {
+    font-size: 11px;
+    color: var(--accent-red);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-top: 1px;
+    text-shadow: none;
+}
+
+.tunnel-status-badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 9px;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-secondary);
+    flex-shrink: 0;
+}
+
+.tunnel-status-badge.connected {
+    color: var(--accent-green);
+    text-shadow: var(--glow-green);
+    border: 1px solid rgba(0, 245, 160, 0.3);
+}
+
+.tunnel-status-badge.connecting {
+    color: var(--accent-yellow);
+    border: 1px solid rgba(245, 197, 66, 0.35);
+    animation: pulse 1.2s ease-in-out infinite;
+}
+
+.tunnel-status-badge.error {
+    color: var(--accent-red);
+    border: 1px solid rgba(255, 71, 87, 0.35);
+}
+
+.card-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+}
+
+/* ── 编辑视图 ────────────────────────────────────────────────────── */
 .tunnel-editor {
     background: var(--bg-card);
     border: 1px solid var(--border-color);
     border-radius: var(--radius-md);
-    padding: 16px;
+    padding: 14px;
     display: flex;
     flex-direction: column;
     gap: 10px;
     margin-bottom: 12px;
-}
-
-#tunnel-editor-area {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
 }
 
 .tunnel-editor input,
@@ -248,7 +490,7 @@ body {
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: var(--radius-sm);
     color: var(--text-primary);
-    padding: 7px 10px;
+    padding: 6px 10px;
     font-family: inherit;
     font-size: 14px;
     outline: none;
@@ -270,14 +512,14 @@ body {
 }
 
 .tunnel-editor .field-name {
-    font-size: 18px;
+    font-size: 17px;
     font-weight: 600;
     color: var(--text-primary);
     background: transparent;
     border: none;
     border-bottom: 1px solid var(--border-color);
     border-radius: 0;
-    padding: 6px 0;
+    padding: 4px 0;
 }
 
 .editor-grid {
@@ -302,118 +544,9 @@ body {
     grid-column: 1 / -1;
 }
 
-.config-actions {
-    display: flex;
-    justify-content: center;
-    padding: 8px 0;
-}
-
-.btn-primary {
-    background: linear-gradient(
-        135deg,
-        rgba(0, 212, 255, 0.15),
-        rgba(0, 245, 160, 0.1)
-    );
-    border: 1px solid var(--accent-cyan);
-    color: var(--accent-cyan);
-    padding: 10px 24px;
-    border-radius: var(--radius-md);
-    font-family: inherit;
-    font-size: 13px;
-    font-weight: 600;
-    cursor: pointer;
-    transition:
-        background 0.2s,
-        box-shadow 0.2s;
-    letter-spacing: 1px;
-}
-
-.btn-primary:hover {
-    background: linear-gradient(
-        135deg,
-        rgba(0, 212, 255, 0.25),
-        rgba(0, 245, 160, 0.2)
-    );
-    box-shadow: var(--glow-cyan);
-}
-
-.editor-actions {
-    display: flex;
-    gap: 8px;
-    justify-content: flex-end;
-    padding-top: 4px;
-}
-
-.btn-start-tunnel {
-    background: linear-gradient(
-        135deg,
-        rgba(0, 245, 160, 0.12),
-        rgba(0, 212, 255, 0.08)
-    );
-    border: 1px solid var(--accent-green);
-    color: var(--accent-green);
-    padding: 8px 18px;
-    border-radius: var(--radius-sm);
-    font-family: inherit;
-    font-size: 14px;
-    font-weight: 600;
-    cursor: pointer;
-    transition:
-        background 0.2s,
-        box-shadow 0.2s;
-}
-
-.btn-start-tunnel:hover {
-    background: linear-gradient(
-        135deg,
-        rgba(0, 245, 160, 0.2),
-        rgba(0, 212, 255, 0.15)
-    );
-    box-shadow: var(--glow-green);
-}
-
-.btn-stop-tunnel {
-    background: rgba(255, 200, 0, 0.08);
-    border: 1px solid var(--accent-yellow);
-    color: var(--accent-yellow);
-    padding: 8px 18px;
-    border-radius: var(--radius-sm);
-    font-family: inherit;
-    font-size: 14px;
-    font-weight: 600;
-    cursor: pointer;
-    transition:
-        background 0.2s,
-        box-shadow 0.2s;
-}
-
-.btn-stop-tunnel:hover {
-    background: rgba(255, 200, 0, 0.15);
-    box-shadow: 0 0 8px rgba(245, 197, 66, 0.3);
-}
-
-.btn-delete-tunnel {
-    background: rgba(255, 71, 87, 0.08);
-    border: 1px solid rgba(255, 71, 87, 0.3);
-    color: var(--accent-red);
-    padding: 8px 18px;
-    border-radius: var(--radius-sm);
-    font-family: inherit;
-    font-size: 13px;
-    font-weight: 600;
-    cursor: pointer;
-    transition:
-        background 0.2s,
-        border-color 0.2s;
-}
-
-.btn-delete-tunnel:hover {
-    background: rgba(255, 71, 87, 0.15);
-}
-
 /* ── Forward Rules Section ──────────────────────────────────────────── */
 .forward-rules {
-    margin-top: 8px;
+    margin-top: 6px;
     border-top: 1px solid var(--border-color);
     padding-top: 10px;
 }
@@ -516,15 +649,42 @@ body {
     background: rgba(255, 71, 87, 0.1);
 }
 
-/* ── 版本号 ────────────────────────────────────────────────────────── */
-.config-version {
-    text-align: center;
+/* 编辑页页脚:返回 / 保存 */
+.editor-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    padding-top: 4px;
+}
+
+/* ── 密钥路径行(输入框 + 浏览按钮) ────────────────────────────── */
+.key-path-row {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+}
+
+.key-path-row input {
+    flex: 1;
+    min-width: 0;
+}
+
+.btn-browse {
+    background: rgba(0, 212, 255, 0.1);
+    border: 1px solid rgba(0, 212, 255, 0.25);
+    color: var(--accent-cyan);
+    padding: 6px 10px;
+    border-radius: var(--radius-sm);
+    font-family: inherit;
     font-size: 11px;
-    color: var(--text-secondary);
-    opacity: 0.5;
-    padding-top: 8px;
-    border-top: 1px solid var(--border-color);
-    margin-top: auto;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.15s;
+    flex-shrink: 0;
+}
+
+.btn-browse:hover {
+    background: rgba(0, 212, 255, 0.2);
 }
 
 /* ── Toast 通知 ──────────────────────────────────────────────────── */
@@ -558,36 +718,6 @@ body {
     margin: 0;
     white-space: pre-wrap;
     word-break: break-word;
-}
-
-/* ── 密钥路径行（输入框 + 浏览按钮） ────────────────────────────── */
-.key-path-row {
-    display: flex;
-    gap: 4px;
-    align-items: center;
-}
-
-.key-path-row input {
-    flex: 1;
-    min-width: 0;
-}
-
-.btn-browse {
-    background: rgba(0, 212, 255, 0.1);
-    border: 1px solid rgba(0, 212, 255, 0.25);
-    color: var(--accent-cyan);
-    padding: 6px 10px;
-    border-radius: var(--radius-sm);
-    font-family: inherit;
-    font-size: 11px;
-    cursor: pointer;
-    white-space: nowrap;
-    transition: background 0.15s;
-    flex-shrink: 0;
-}
-
-.btn-browse:hover {
-    background: rgba(0, 212, 255, 0.2);
 }
 
 /* ── 隐藏 Number 输入框上下箭头 ──────────────────────────────────── */
