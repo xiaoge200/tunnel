@@ -14,6 +14,11 @@ use tokio::sync::{Mutex, Notify};
 use crate::config::*;
 
 const METRIC_EMIT_INTERVAL: Duration = Duration::from_secs(1);
+/// 连接失败 / 断开后的重试间隔(可被停止信号打断)。
+const RETRY_DELAY: Duration = Duration::from_secs(5);
+/// 端口绑定失败后的单次等待与重试上限。
+const BIND_RETRY_DELAY: Duration = Duration::from_millis(500);
+const BIND_RETRY_MAX: u32 = 5;
 
 // ─── Russh Client Handler ────────────────────────────────────────────
 
@@ -70,9 +75,32 @@ async fn unregister_runtime(
     let _ = crate::refresh_tray(app).await;
 }
 
-/// 一次运行尝试:一条 SSH 连接 + 全部转发监听。
-/// 结束(用户停止 / SSH 断开 / 连接失败)时先发布终态,再由 runner 任务
-/// 调 `unregister_runtime` 摘除注册。
+/// 绑定本地端口,带 5×500ms 重试(休眠唤醒后旧监听器释放端口有延迟)。
+///
+/// 注意:Windows 上**不能**开 SO_REUSEADDR —— 它会让多个 socket 同时
+/// 绑上同一端口,新连接被随机分发到已失效的旧监听器(表现为"隧道无效")。
+/// 只能靠重试等旧监听器自行退出。
+async fn bind_local_port(port: u16) -> std::io::Result<TcpListener> {
+    let addr = format!("127.0.0.1:{}", port);
+    let mut last_err = None;
+    for attempt in 0..BIND_RETRY_MAX {
+        match TcpListener::bind(&addr).await {
+            Ok(l) => return Ok(l),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < BIND_RETRY_MAX {
+                    tokio::time::sleep(BIND_RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
+/// 一次运行:包含外层自动重连循环。
+/// SSH 连接失败或意外断开后,在 RETRY_DELAY 后自动重连,**直到用户停止**;
+/// 因此 runtime 只在用户停止时退出(由 runner 任务摘除注册)。
+/// 连接失败会发布带原因的 Error(前端卡片内联显示),随后继续后台重试。
 struct TunnelRuntime {
     config: TunnelConfig,
     app_handle: AppHandle,
@@ -121,134 +149,218 @@ impl TunnelRuntime {
             return;
         }
 
-        self.publish_status(TunnelStatus::Connecting).await;
-
         let ssh_addr = format!("{}:{}", self.config.ssh_host, self.config.ssh_port);
 
-        // Build SSH session
-        let handle = match self.build_session(&ssh_addr).await {
-            Ok(h) => h,
-            Err(e) => {
-                log::error!(
-                    "Tunnel '{}' SSH connection failed: {:#}",
-                    self.config.name,
-                    e
-                );
-                // 用户在连接期间点了停止:按正常断开处理,不闪红
-                if self.stopped.load(Ordering::Relaxed) {
-                    self.publish_status(TunnelStatus::Disconnected).await;
-                } else {
-                    self.publish_status(TunnelStatus::Error(format!("{:#}", e))).await;
+        // ─── 外层自动重连循环 ──────────────────────────────────────
+        'retry: loop {
+            if self.stopped.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // ── 连接阶段 ────────────────────────────────────────────
+            self.publish_status(TunnelStatus::Connecting).await;
+            let handle = match self.build_session(&ssh_addr).await {
+                Ok(h) => h,
+                Err(e) => {
+                    log::error!(
+                        "Tunnel '{}' SSH connection failed: {:#}",
+                        self.config.name,
+                        e
+                    );
+                    if self.stopped.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // 带原因发布一次错误(卡片内联显示),随后后台自动重试
+                    self.publish_status(TunnelStatus::Error(format!("{:#}", e)))
+                        .await;
+                    self.sleep_interruptible(RETRY_DELAY).await;
+                    continue;
                 }
+            };
+
+            // 连接期间用户点了停止:关掉刚建好的会话
+            if self.stopped.load(Ordering::Relaxed) {
+                let _ = handle
+                    .disconnect(Disconnect::ByApplication, "user stopped", "")
+                    .await;
+                break;
+            }
+
+            // ── 先绑定全部本地端口:任一失败 → 整体放弃本次会话重试 ──
+            //     (避免"SSH 已连但某转发静默失效"的半工作隧道)
+            let mut bound: Vec<(ForwardRule, TcpListener)> = Vec::new();
+            let mut bind_ok = true;
+            for fwd in &self.config.forwards {
+                match bind_local_port(fwd.local_port).await {
+                    Ok(listener) => bound.push((fwd.clone(), listener)),
+                    Err(e) => {
+                        log::error!(
+                            "Tunnel '{}' port {} bind failed: {}",
+                            self.config.name,
+                            fwd.local_port,
+                            e
+                        );
+                        bind_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !bind_ok {
+                drop(bound);
+                // 会话尚未交给任何子任务,这里主动断开避免连接泄漏
+                let _ = handle
+                    .disconnect(Disconnect::ByApplication, "port bind failed", "")
+                    .await;
+                if self.stopped.load(Ordering::Relaxed) {
+                    break;
+                }
+                self.publish_status(TunnelStatus::Connecting).await;
+                self.sleep_interruptible(Duration::from_secs(3)).await;
+                continue 'retry;
+            }
+
+            let handle = Arc::new(handle);
+
+            // ── 会话级取消标记:断开重连时终止旧会话的全部子任务 ────
+            let session_cancel = Arc::new(AtomicBool::new(false));
+
+            // ── SSH 断线检测 ───────────────────────────────────────
+            let disconnect_notify = Arc::new(Notify::new());
+            let watcher_handle = handle.clone();
+            let watcher_notify = disconnect_notify.clone();
+            let watcher_stopped = self.stopped.clone();
+            let watcher_cancel = session_cancel.clone();
+            tokio::spawn(async move {
+                loop {
+                    if watcher_stopped.load(Ordering::Relaxed)
+                        || watcher_cancel.load(Ordering::Relaxed)
+                    {
+                        return;
+                    }
+                    if watcher_handle.is_closed() {
+                        watcher_notify.notify_one();
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            });
+
+            // 新会话计数器从零开始,避免跨会话产生速率尖峰
+            self.rx_bytes.store(0, Ordering::Relaxed);
+            self.tx_bytes.store(0, Ordering::Relaxed);
+            self.last_rx.store(0, Ordering::Relaxed);
+            self.last_tx.store(0, Ordering::Relaxed);
+
+            // ── 前向监听任务(使用已绑定的 listener) ──────────────
+            for (fwd, listener) in bound {
+                let task_handle = handle.clone();
+                let task_stopped = self.stopped.clone();
+                let task_cancel = session_cancel.clone();
+                let task_rx = self.rx_bytes.clone();
+                let task_tx = self.tx_bytes.clone();
+                let name = self.config.name.clone();
+                tokio::spawn(async move {
+                    run_forward_listener(
+                        task_handle,
+                        task_stopped,
+                        task_cancel,
+                        task_rx,
+                        task_tx,
+                        &name,
+                        fwd,
+                        listener,
+                    )
+                    .await;
+                });
+            }
+
+            // ── Metrics emitter task (aggregated across all forwards) ────
+            // 直接 emit,不走 publish —— 否则每秒都会重建一次托盘菜单。
+            let metric_stopped = self.stopped.clone();
+            let metric_cancel = session_cancel.clone();
+            let metric_cfg = self.config.clone();
+            let metric_ah = self.app_handle.clone();
+            let metric_rx = self.rx_bytes.clone();
+            let metric_tx = self.tx_bytes.clone();
+            let metric_last_rx = self.last_rx.clone();
+            let metric_last_tx = self.last_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    if metric_stopped.load(Ordering::Relaxed)
+                        || metric_cancel.load(Ordering::Relaxed)
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(METRIC_EMIT_INTERVAL).await;
+                    if metric_stopped.load(Ordering::Relaxed)
+                        || metric_cancel.load(Ordering::Relaxed)
+                    {
+                        return;
+                    }
+
+                    let current_rx = metric_rx.load(Ordering::Relaxed);
+                    let current_tx = metric_tx.load(Ordering::Relaxed);
+                    let prev_rx = metric_last_rx.swap(current_rx, Ordering::Relaxed);
+                    let prev_tx = metric_last_tx.swap(current_tx, Ordering::Relaxed);
+
+                    let metric = TunnelMetric {
+                        id: metric_cfg.id.clone(),
+                        name: metric_cfg.name.clone(),
+                        status: TunnelStatus::Connected,
+                        rx_bytes_per_sec: (current_rx.saturating_sub(prev_rx)) as f64,
+                        tx_bytes_per_sec: (current_tx.saturating_sub(prev_tx)) as f64,
+                    };
+                    let _ = metric_ah.emit("tunnel-metric", &metric);
+                }
+            });
+
+            log::info!(
+                "Tunnel '{}' started with {} forward(s) via {}",
+                self.config.name,
+                self.config.forwards.len(),
+                ssh_addr
+            );
+            self.publish_status(TunnelStatus::Connected).await;
+
+            // ── 等待用户停止或 SSH 断线 ───────────────────────────
+            let disconnected = tokio::select! {
+                _ = self.wait_until_stopped() => {
+                    log::info!("Tunnel '{}' stopped by user", self.config.name);
+                    false
+                }
+                _ = disconnect_notify.notified() => {
+                    log::warn!(
+                        "Tunnel '{}' SSH connection lost, reconnecting...",
+                        self.config.name
+                    );
+                    true
+                }
+            };
+
+            // ── 清理旧会话(终止全部子任务,释放端口) ───────────────
+            session_cancel.store(true, Ordering::Relaxed);
+
+            if !disconnected {
+                break; // 用户主动停止 → 退出外层重连循环
+            }
+
+            // 断开后等一会儿再重连,避免频繁重试
+            self.sleep_interruptible(RETRY_DELAY).await;
+        }
+
+        // 只有用户停止才会走到这里(断开是自动重连,不退出)
+        self.publish_status(TunnelStatus::Disconnected).await;
+    }
+
+    /// 可被停止信号打断的 sleep:让停止响应更及时(500ms 步进)。
+    async fn sleep_interruptible(&self, total: Duration) {
+        let mut waited = Duration::ZERO;
+        while waited < total {
+            if self.stopped.load(Ordering::Relaxed) {
                 return;
             }
-        };
-        let handle = Arc::new(handle);
-
-        // SSH disconnection watcher
-        let disconnect_notify = Arc::new(Notify::new());
-        let watcher_handle = handle.clone();
-        let watcher_notify = disconnect_notify.clone();
-        let watcher_stopped = self.stopped.clone();
-        tokio::spawn(async move {
-            loop {
-                if watcher_stopped.load(Ordering::Relaxed) {
-                    return;
-                }
-                if watcher_handle.is_closed() {
-                    watcher_notify.notify_one();
-                    return;
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        });
-
-        // Spawn one listener task per forward rule
-        for fwd in &self.config.forwards {
-            let task_handle = handle.clone();
-            let task_stopped = self.stopped.clone();
-            let task_rx = self.rx_bytes.clone();
-            let task_tx = self.tx_bytes.clone();
-            let target_host = fwd.target_host.clone();
-            let target_port = fwd.target_port;
-            let local_port = fwd.local_port;
-            let name = self.config.name.clone();
-
-            tokio::spawn(async move {
-                run_forward_listener(
-                    task_handle,
-                    task_stopped,
-                    task_rx,
-                    task_tx,
-                    &name,
-                    local_port,
-                    &target_host,
-                    target_port,
-                )
-                .await;
-            });
-        }
-
-        // ── Metrics emitter task (aggregated across all forwards) ────
-        // 直接 emit,不走 publish —— 否则每秒都会重建一次托盘菜单。
-        let metric_stopped = self.stopped.clone();
-        let metric_cfg = self.config.clone();
-        let metric_ah = self.app_handle.clone();
-        let metric_rx = self.rx_bytes.clone();
-        let metric_tx = self.tx_bytes.clone();
-        let metric_last_rx = self.last_rx.clone();
-        let metric_last_tx = self.last_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                if metric_stopped.load(Ordering::Relaxed) {
-                    return;
-                }
-                tokio::time::sleep(METRIC_EMIT_INTERVAL).await;
-                if metric_stopped.load(Ordering::Relaxed) {
-                    return;
-                }
-
-                let current_rx = metric_rx.load(Ordering::Relaxed);
-                let current_tx = metric_tx.load(Ordering::Relaxed);
-                let prev_rx = metric_last_rx.swap(current_rx, Ordering::Relaxed);
-                let prev_tx = metric_last_tx.swap(current_tx, Ordering::Relaxed);
-
-                let metric = TunnelMetric {
-                    id: metric_cfg.id.clone(),
-                    name: metric_cfg.name.clone(),
-                    status: TunnelStatus::Connected,
-                    rx_bytes_per_sec: (current_rx.saturating_sub(prev_rx)) as f64,
-                    tx_bytes_per_sec: (current_tx.saturating_sub(prev_tx)) as f64,
-                };
-                let _ = metric_ah.emit("tunnel-metric", &metric);
-            }
-        });
-
-        log::info!(
-            "Tunnel '{}' started with {} forward(s) via {}",
-            self.config.name,
-            self.config.forwards.len(),
-            ssh_addr
-        );
-        self.publish_status(TunnelStatus::Connected).await;
-
-        // Wait for stop or disconnect
-        tokio::select! {
-            _ = self.wait_until_stopped() => {
-                log::info!("Tunnel '{}' stopped by user", self.config.name);
-            }
-            _ = disconnect_notify.notified() => {
-                log::warn!("Tunnel '{}' SSH connection lost", self.config.name);
-            }
-        }
-
-        // Cleanup — 终态必须先发布(前端/托盘据此复位),之后 runner 任务才会
-        // 调 remove_runtime 摘除注册。
-        if self.stopped.load(Ordering::Relaxed) {
-            self.publish_status(TunnelStatus::Disconnected).await;
-        } else {
-            self.publish_status(TunnelStatus::Error("SSH 连接已断开".to_string()))
-                .await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            waited += Duration::from_millis(500);
         }
     }
 
@@ -304,36 +416,24 @@ impl TunnelRuntime {
 
 // ─── Per-forward listener ──────────────────────────────────────────────
 
+/// 在已绑定的 listener 上接收连接并转发。
+/// stopped / cancel 任一置位即退出(用户停止 / 会话重建)。
 async fn run_forward_listener(
     handle: Arc<client::Handle<SshClientHandler>>,
     stopped: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
     rx_bytes: Arc<AtomicU64>,
     tx_bytes: Arc<AtomicU64>,
     tunnel_name: &str,
-    local_port: u16,
-    target_host: &str,
-    target_port: u16,
+    fwd: ForwardRule,
+    listener: TcpListener,
 ) {
-    let local_addr = format!("127.0.0.1:{}", local_port);
-    let listener = match TcpListener::bind(&local_addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            log::error!(
-                "Forward {}:{} bind failed: {:#}",
-                tunnel_name,
-                local_port,
-                e
-            );
-            return;
-        }
-    };
-
     log::info!(
         "Forward {} listening on {} -> {}:{}",
         tunnel_name,
-        local_addr,
-        target_host,
-        target_port
+        listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+        fwd.target_host,
+        fwd.target_port
     );
 
     loop {
@@ -344,29 +444,34 @@ async fn run_forward_listener(
                         let h = handle.clone();
                         let rx = rx_bytes.clone();
                         let tx = tx_bytes.clone();
-                        let th = target_host.to_string();
+                        let th = fwd.target_host.clone();
+                        let tp = fwd.target_port;
                         tokio::spawn(async move {
-                            if let Err(e) = forward_connection(h, &th, target_port, stream, rx, tx).await {
+                            if let Err(e) = forward_connection(h, &th, tp, stream, rx, tx).await {
                                 log::error!("Forward error: {}", e);
                             }
                         });
                     }
                     Err(e) => {
-                        log::error!("Accept error on port {}: {}", local_port, e);
+                        log::error!("Accept error on port {}: {}", fwd.local_port, e);
                     }
                 }
             }
             _ = wait_until(stopped.clone()) => {
-                log::info!("Forward on port {} stopping", local_port);
+                log::info!("Forward on port {} stopping (user)", fwd.local_port);
+                break;
+            }
+            _ = wait_until(cancel.clone()) => {
+                log::info!("Forward on port {} stopping (session reset)", fwd.local_port);
                 break;
             }
         }
     }
 }
 
-async fn wait_until(stopped: Arc<AtomicBool>) {
+async fn wait_until(flag: Arc<AtomicBool>) {
     loop {
-        if stopped.load(Ordering::Relaxed) {
+        if flag.load(Ordering::Relaxed) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
