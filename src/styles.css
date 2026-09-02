@@ -375,11 +375,29 @@ body {
     flex: 1;
 }
 
+/* 挂载区撑满配置面板,版本号页脚借 margin-top:auto 贴底 */
+#tunnel-editor-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+}
+
 #no-tunnels-msg {
     color: var(--text-secondary);
     font-size: 14px;
     text-align: center;
     padding: 36px 20px;
+}
+
+/* ── 版本号页脚 ──────────────────────────────────────────────────── */
+.config-version {
+    text-align: center;
+    font-size: 11px;
+    color: var(--text-secondary);
+    opacity: 0.55;
+    padding-top: 8px;
+    border-top: 1px solid var(--border-color);
+    margin-top: auto;
 }
 
 .tunnel-list {

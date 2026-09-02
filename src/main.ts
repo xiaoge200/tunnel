@@ -2,7 +2,20 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
+import { getVersion } from "@tauri-apps/api/app";
 import { open, confirm } from "@tauri-apps/plugin-dialog";
+
+// 全局防御:无边框应用中禁掉右键菜单与 Ctrl+滚轮 页面缩放
+window.addEventListener("contextmenu", (e) => e.preventDefault(), {
+  capture: true,
+});
+window.addEventListener(
+  "wheel",
+  (e) => {
+    if (e.ctrlKey) e.preventDefault();
+  },
+  { passive: false },
+);
 
 // ─── 类型:与 src-tauri/src/config.rs 的 serde 形状一一对应 ───────────
 // 修改 Rust 侧结构时务必同步这里(snake_case 字段名、外部标签枚举)。
@@ -147,7 +160,8 @@ function renderCtlButton(
   } else if (busy === "stop") {
     btn.textContent = "⏳ 停止中…";
     btn.disabled = true;
-  } else if (kind === "Connected") {
+  } else if (kind === "Connected" || kind === "Error") {
+    // Error = 运行中且后台自动重试中 → 用"停止"取消重试
     btn.textContent = "⏹ 停止";
     btn.classList.add("btn-stop-tunnel");
   } else if (kind === "Connecting") {
@@ -169,7 +183,8 @@ async function clickCtl(
   getBusy: () => "start" | "stop" | null,
   id: string,
 ) {
-  if (kind === "Connected") {
+  if (kind === "Connected" || kind === "Error") {
+    // Error 态 = 运行中(自动重试),同样走停止
     setBusy("stop");
     try {
       await invoke("stop_tunnel", { id });
@@ -413,14 +428,24 @@ class ConfigPanel {
         text: "暂无隧道,点击上方 [+ 添加隧道] 创建第一个连接",
       });
       this.area.appendChild(empty);
-      return;
+    } else {
+      const list = el("div", { class: "tunnel-list" });
+      for (const t of this.tunnels) {
+        list.appendChild(this.makeCard(t));
+      }
+      this.area.appendChild(list);
     }
 
-    const list = el("div", { class: "tunnel-list" });
-    for (const t of this.tunnels) {
-      list.appendChild(this.makeCard(t));
-    }
-    this.area.appendChild(list);
+    // ── 版本号页脚 ───────────────────────────────────────────────
+    const versionEl = el("div", { class: "config-version" }) as HTMLDivElement;
+    getVersion()
+      .then((v) => {
+        versionEl.textContent = `v${v}`;
+      })
+      .catch(() => {
+        versionEl.textContent = "-";
+      });
+    this.area.appendChild(versionEl);
   }
 
   private makeCard(t: TunnelConfig): HTMLElement {
