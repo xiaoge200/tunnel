@@ -50,9 +50,9 @@ jobs:
           fi
 
       - name: Setup Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
 
       - name: Setup Rust
@@ -66,8 +66,6 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # 只构建不发布:不传 tagName,tauri-action 不创建/上传 Release
-      # (beforeBuildCommand 会先跑 npm run build 产出 dist/)
       - name: Build Windows bundles
         uses: tauri-apps/tauri-action@v0
         env:
@@ -87,10 +85,10 @@ jobs:
           ls -la release-assets/
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ matrix.label }}
-          path: release-assets/*
+          path: release-assets/
           if-no-files-found: error
           retention-days: 1
 
@@ -101,12 +99,12 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Setup Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
 
       - name: Prepare release metadata
         id: meta
@@ -131,33 +129,30 @@ jobs:
           EOF
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v4
         with:
           path: assets
 
-      # 未来加入 macOS/Linux 后:按平台加前缀(01-Win/02-macOS/03-Linux)保证
-      # Releases 页分组顺序,并同步扩展上面的 RELEASE_BODY。
+      # 兼容单层和双层目录的文件收集逻辑
       - name: Collect ordered assets
         shell: bash
         run: |
           mkdir -p ordered-assets
-          for f in assets/*/*; do
-            [ -f "$f" ] || continue
-            cp -f "$f" "ordered-assets/$(basename "$f")"
-          done
+          # 使用 find 深度递归查找 .exe 和 .msi，不受目录层级影响
+          find assets/ -type f \( -name '*.exe' -o -name '*.msi' \) -exec cp -f {} ordered-assets/ \;
           echo "=== Ordered assets ==="
           ls -la ordered-assets/
 
       # 创建草稿 Release 并上传(overwrite 默认开,重跑/移动 tag 幂等)
       - name: Create draft release & upload assets
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           # workflow_dispatch 触发时 tag 尚不存在,基于当前提交创建
           target_commitish: ${{ github.sha }}
-          name: Tunnel v${{ steps.meta.outputs.version }}
+          name: v${{ steps.meta.outputs.version }}
           body: ${{ steps.meta.outputs.RELEASE_BODY }}
           draft: true
           prerelease: false
